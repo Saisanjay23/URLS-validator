@@ -32,9 +32,11 @@ app = FastAPI(
     version="5.0.0",
 )
 
+# Frontend is served same-origin (no CORS needed); Java calls server-to-server
+# (CORS not applicable). Extra browser origins come from URLCHECK_ALLOWED_ORIGINS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=config.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

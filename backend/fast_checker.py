@@ -22,6 +22,7 @@ Techniques used (all free, no APIs, no cookies, no browser):
 
 import asyncio
 import io
+import ipaddress
 import random
 import re
 import socket
@@ -268,6 +269,22 @@ def _classify_connection_error(e: Exception) -> str:
     if "ssl" in msg:
         return "SSL handshake failure / secure connection error"
     return f"Connection failed: {type(e).__name__}"
+
+
+def _is_private_target(hostname: str) -> bool:
+    """SSRF guard: refuse to fetch loopback/private/link-local targets so the
+    API can't be used to probe internal infrastructure. Real social/app URLs
+    are always public hostnames, so legitimate checks are unaffected."""
+    if not hostname:
+        return False
+    host = hostname.strip("[]").lower()
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_unspecified
 
 
 # ── DNS Pre-Check ─────────────────────────────────────────────────────────────
@@ -633,20 +650,10 @@ async def _anonymous_fb_check(session: aiohttp.ClientSession, url: str) -> str |
             if any(sig in lower_html for sig in takedown_signals):
                 return "taken_down"
 
-            # Redirect signature check for status 200 and title "Facebook" or empty
-            if status == 200 and (title_lower == "facebook" or not title.strip()):
-                original_lower = url.lower()
-                final_lower = final_url.lower()
-                def _has_vanity_format(u: str) -> bool:
-                    return any(x in u for x in ("/@", "/p/", "/groups/", "/pages/", "/posts/", "/photos/", "/permalink/"))
-                orig_has = _has_vanity_format(original_lower)
-                final_has = _has_vanity_format(final_lower)
-                if not orig_has and not final_has:
-                    return "taken_down"
-                if orig_has:
-                    return "taken_down"
-
-            # Generic title with no takedown signals = inconclusive
+            # A generic "Facebook" title with no takedown text is NOT evidence of
+            # removal: FB serves the same generic login wall for live pages
+            # (e.g. facebook.com/facebook) when it challenges anonymous/bot
+            # traffic. Only explicit takedown phrases above may confirm "down".
             return None
     except Exception:
         return None
@@ -728,24 +735,10 @@ async def _check_facebook(session: aiohttp.ClientSession, url: str) -> dict:
                             break
                 return {"status": "taken_down", "reason": reason, "http_code": status}
 
-            # Redirect signature check for status 200 (if it's not a login wall)
-            if status == 200 and not primary_says_login and primary_says_empty and graph_exists is None:
-                original_lower = url.lower()
-                final_lower = result["final_url"].lower()
-                
-                # Check for vanity format indicators
-                def _has_vanity_format(u: str) -> bool:
-                    return any(x in u for x in ("/@", "/p/", "/groups/", "/pages/", "/posts/", "/photos/", "/permalink/"))
-                
-                orig_has = _has_vanity_format(original_lower)
-                final_has = _has_vanity_format(final_lower)
-                
-                # If neither original nor final has vanity formatting (e.g. stayed on raw username path)
-                if not orig_has and not final_has:
-                    return {"status": "taken_down", "reason": "Facebook page not found (no redirect to profile)", "http_code": status}
-                # If it already had vanity formatting but still returned generic "Facebook" title
-                if orig_has:
-                    return {"status": "taken_down", "reason": "Facebook page not found (profile page returned generic title)", "http_code": status}
+            # A generic title with Graph API and bot check both inconclusive is a
+            # login wall / bot challenge, not evidence of removal — live pages
+            # (e.g. facebook.com/facebook) hit this path under anonymous access.
+            # Takedowns must be confirmed by explicit phrases or the Graph API.
 
             # If it was redirected to a login wall, and bot/graph checks are inconclusive, return uncertain
             if primary_says_login:
@@ -1551,8 +1544,14 @@ async def process_urls_stream(raw_urls: list[str]) -> AsyncGenerator[dict, None]
             "http_code": None, "engine": "fast"
         }
 
-        # Enterprise enhancement: circuit breaker check
         hostname = urlparse(url).hostname or ""
+
+        # SSRF guard: never fetch internal/private addresses
+        if _is_private_target(hostname):
+            result["reason"] = "Private/internal address — not checked (SSRF guard)"
+            return result
+
+        # Enterprise enhancement: circuit breaker check
         if config.ENABLE_CIRCUIT_BREAKER:
             if await circuit_breaker.is_open(hostname):
                 result["status"] = "uncertain"
@@ -1608,6 +1607,15 @@ async def process_urls_stream(raw_urls: list[str]) -> AsyncGenerator[dict, None]
 
 # ── CSV/ZIP Export ────────────────────────────────────────────────────────────
 
+def _csv_safe(value) -> str:
+    """Neutralize spreadsheet formula injection: URLs/reasons are attacker-
+    controlled, and Excel executes cells starting with = + - @ tab or CR."""
+    text = "" if value is None else str(value)
+    if text and text[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
+
+
 def create_export_zip(results: list[dict]) -> bytes:
     """Build a ZIP containing report.csv."""
     import csv as csv_mod
@@ -1619,10 +1627,10 @@ def create_export_zip(results: list[dict]) -> bytes:
         for i, r in enumerate(results, 1):
             writer.writerow([
                 i,
-                r.get("url", ""),
-                r.get("platform", "generic"),
-                r.get("status", ""),
-                r.get("reason", ""),
+                _csv_safe(r.get("url", "")),
+                _csv_safe(r.get("platform", "generic")),
+                _csv_safe(r.get("status", "")),
+                _csv_safe(r.get("reason", "")),
                 r.get("http_code", "")
             ])
         zf.writestr("report.csv", "\ufeff" + csv_buf.getvalue())

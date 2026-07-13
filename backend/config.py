@@ -79,6 +79,17 @@ TCP_KEEPALIVE_TIMEOUT      = int(os.environ.get("URLCHECK_KEEPALIVE", "30"))
 TCP_IDLE_TIMEOUT           = int(os.environ.get("URLCHECK_IDLE_TIMEOUT", "60"))
 
 
+# ── CORS ─────────────────────────────────────────────────────────────────────
+# Browser origins allowed to call the API. The bundled frontend is served from
+# the same origin and needs no CORS entry; server-to-server callers (Java)
+# ignore CORS entirely. Add origins only if the frontend is hosted separately:
+#     export URLCHECK_ALLOWED_ORIGINS=https://validator.example.com,https://other.example.com
+
+ALLOWED_ORIGINS: list[str] = [
+    o.strip() for o in os.environ.get("URLCHECK_ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
+
+
 # ── Retry Configuration ──────────────────────────────────────────────────────
 
 RETRY_MAX_ATTEMPTS         = int(os.environ.get("URLCHECK_RETRY_MAX", "3"))
