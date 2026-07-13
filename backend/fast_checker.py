@@ -33,6 +33,12 @@ from urllib.parse import urlparse
 
 import aiohttp
 
+try:
+    from curl_cffi.requests import AsyncSession as CurlCffiAsyncSession
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+
 from backend.url_utils import detect_platform, normalize_url, deduplicate_urls
 from backend.logger import get_logger, log_check_result
 
@@ -1327,8 +1333,23 @@ async def _check_app_store(session: aiohttp.ClientSession, url: str) -> dict:
             return {"status": "taken_down", "reason": "App not found (404/410)", "http_code": status}
                 
         if status in (401, 403, 429, 999):
-            # Anti-bot walls block us from verifying the package contents. Report as uncertain.
-            return {"status": "uncertain", "reason": f"Anti-bot wall / security challenge ({status})", "http_code": status}
+            if HAS_CURL_CFFI:
+                # Attempt to bypass Cloudflare / Anti-bot walls using TLS spoofing
+                try:
+                    async with CurlCffiAsyncSession(impersonate="chrome116") as curl_session:
+                        curl_res = await curl_session.get(url, timeout=10, allow_redirects=True)
+                        if curl_res.status_code == 200:
+                            status = 200
+                            html = curl_res.text
+                        elif curl_res.status_code in (404, 410):
+                            return {"status": "taken_down", "reason": f"App not found ({curl_res.status_code})", "http_code": curl_res.status_code}
+                        else:
+                            return {"status": "uncertain", "reason": f"Anti-bot wall / security challenge ({status}) [curl_cffi={curl_res.status_code}]", "http_code": status}
+                except Exception as curl_e:
+                    return {"status": "uncertain", "reason": f"Anti-bot wall / security challenge ({status}) [curl_cffi error]", "http_code": status}
+            else:
+                # Anti-bot walls block us from verifying the package contents. Report as uncertain.
+                return {"status": "uncertain", "reason": f"Anti-bot wall / security challenge ({status})", "http_code": status}
             
         if status == 200:
             html_lower = html.lower()
