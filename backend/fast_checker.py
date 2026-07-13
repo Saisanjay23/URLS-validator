@@ -851,18 +851,48 @@ async def _check_linkedin(session: aiohttp.ClientSession, url: str) -> dict:
 
 async def _check_youtube(session: aiohttp.ClientSession, url: str) -> dict:
     """
-    YouTube checker — uses Googlebot UA for reliable OG meta tags.
+    YouTube checker — Hybrid oEmbed + Googlebot HTML Scraping Architecture.
 
-    CRITICAL INSIGHT: YouTube serves ALL videos with 'video unavailable' in the
-    raw HTML skeleton (it's a JS-hidden template). This is NOT a real signal.
-    The ONLY reliable signals from raw HTTP are:
-      1. og:title meta tag (Googlebot gets this, browser UA may not)
-      2. HTTP 404 status
-      3. <link rel='canonical'> pointing to a valid video/channel URL
-      4. itemprop='channelId' for channels
-
-    Using 'video unavailable' from body text = guaranteed false negatives.
+    1. For videos (watch, v, embed, shorts, youtu.be), queries the official,
+       free public oEmbed API first. This is highly accurate, fast, and does
+       not get blocked by data center IP consent screens.
+    2. For channels, playlists, or when oEmbed fails, falls back to raw page
+       scraping using Googlebot UA.
     """
+    # Step 1: Detect if it is a video URL
+    url_lower = url.lower()
+    is_video = any(x in url_lower for x in ("/watch?", "/v/", "/embed/", "/shorts/", "youtu.be/"))
+    
+    if is_video:
+        # Normalize Shorts URLs to watch URLs before calling oEmbed
+        target_url = url
+        if "/shorts/" in url_lower:
+            target_url = url.replace("/shorts/", "/watch?v=")
+            
+        try:
+            oembed_url = f"https://www.youtube.com/oembed?url={target_url}&format=json"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json"
+            }
+            async with session.get(oembed_url, timeout=aiohttp.ClientTimeout(total=6), headers=headers) as resp:
+                status = resp.status
+                if status == 200:
+                    import json
+                    data = json.loads(await resp.text())
+                    title = data.get("title", "")
+                    author = data.get("author_name", "")
+                    detail = f" ({title} by {author})" if title else ""
+                    return {"status": "active", "reason": f"YouTube is active{detail}", "http_code": 200}
+                elif status in (400, 404):
+                    # oEmbed returns 400 Bad Request or 404 Not Found for deleted/private/nonexistent videos
+                    return {"status": "taken_down", "reason": "YouTube video not found or private (oEmbed verified)", "http_code": status}
+                # For 403, 429, or other codes, fall back to page scraping
+                logger.warning(f"[YOUTUBE] oEmbed returned status {status} for {url}. Falling back to page scraper...")
+        except Exception as e:
+            logger.warning(f"[YOUTUBE] oEmbed failed for {url}: {e}. Falling back to page scraper...")
+
+    # Step 2: Fallback to HTML Page Scraper (primarily for channels, or if oEmbed is rate-limited)
     try:
         # MUST use bot UA — YouTube serves proper OG tags to Googlebot
         # but serves JS-only skeleton to browser UAs
