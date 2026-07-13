@@ -872,9 +872,31 @@ async def _check_youtube(session: aiohttp.ClientSession, url: str) -> dict:
         og = _og_title(html)
         og_desc = _og_description(html)
         canonical = _canonical(html)
+        final_url = result.get("final_url", url)
+
+        # Check for consent walls, captchas, and rate limits (common on cloud/VPS IPs)
+        parsed_final = urlparse(final_url)
+        final_host = parsed_final.hostname or ""
+        lower_html = html.lower()
+        
+        is_consent_redirect = "consent." in final_host or "accounts.google.com" in final_host or "google.com/consent" in final_url
+        is_consent_page = "before you continue to youtube" in lower_html or "consent.youtube.com" in lower_html
+        is_rate_limited = "unusual traffic" in lower_html or "systems have detected" in lower_html
+        is_sorry_redirect = "/sorry/index" in final_url or "/sorry/" in final_url
+        
+        if is_consent_redirect or is_consent_page or is_rate_limited or is_sorry_redirect:
+            reason = "YouTube blocked request (consent page / rate limit / captcha)"
+            if is_rate_limited or is_sorry_redirect:
+                reason = "YouTube rate limited (unusual traffic detected / Captcha)"
+            elif is_consent_redirect or is_consent_page:
+                reason = "YouTube consent wall encountered"
+            return {"status": "uncertain", "reason": reason, "http_code": status}
 
         if status == 404:
             return {"status": "taken_down", "reason": "YouTube content not found (404)", "http_code": 404}
+
+        if status >= 400:
+            return {"status": "uncertain", "reason": f"YouTube server/block response ({status})", "http_code": status}
 
         # Step 1: og:title is the most reliable signal
         # If Googlebot gets a real og:title, the content EXISTS
