@@ -436,7 +436,7 @@
         });
     }
 
-    // ── Export Report Modal Logic ─────────────────────────────────────────
+    // ── Export Logic (Instant Inline Dropdown) ─────────────────────────────
     const exportModal = document.getElementById("exportModal");
     const closeExportModalBtn = document.getElementById("closeExportModalBtn");
     const cancelExportBtn = document.getElementById("cancelExportBtn");
@@ -444,35 +444,46 @@
     const exportFilterSelect = document.getElementById("exportFilterSelect");
     const exportModalMsg = document.getElementById("exportModalMsg");
 
-    let currentExportType = ""; // "csv" or "zip"
+    let currentExportType = "";
 
-    exportBtn.addEventListener("click", () => {
+    function openExportModal(type) {
         if (allResults.length === 0) return;
-        currentExportType = "csv";
+        currentExportType = type;
         exportModalMsg.textContent = "";
-        exportFilterSelect.value = currentFilter; // Set dropdown to match current active UI filter
+        exportFilterSelect.value = currentFilter;
         exportModal.style.display = "flex";
-    });
-
-    exportZipBtn.addEventListener("click", () => {
-        if (allResults.length === 0) return;
-        currentExportType = "zip";
-        exportModalMsg.textContent = "";
-        exportFilterSelect.value = currentFilter; // Set dropdown to match current active UI filter
-        exportModal.style.display = "flex";
-    });
+    }
 
     function closeExportModal() {
         exportModal.style.display = "none";
     }
 
-    closeExportModalBtn.addEventListener("click", closeExportModal);
-    cancelExportBtn.addEventListener("click", closeExportModal);
+    exportBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openExportModal("csv");
+    });
+
+    exportZipBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openExportModal("zip");
+    });
+
+    closeExportModalBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        closeExportModal();
+    });
+    cancelExportBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        closeExportModal();
+    });
     exportModal.addEventListener("click", (e) => {
         if (e.target === exportModal) closeExportModal();
     });
 
-    confirmExportBtn.addEventListener("click", async () => {
+    confirmExportBtn.addEventListener("click", async (e) => {
+        e.preventDefault();
         const filterVal = exportFilterSelect.value;
         const filtered = allResults.filter(r => filterVal === "all" || r.status === filterVal);
 

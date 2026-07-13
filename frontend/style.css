@@ -151,6 +151,17 @@ body {
   color: var(--text);
 }
 
+/* Ensure clicks on SVG icons inside buttons always trigger the button */
+.btn svg,
+.btn svg * {
+  pointer-events: none;
+}
+
+.btn:active {
+  transform: scale(0.96);
+  transition: transform 0.05s;
+}
+
 .card__actions {
   display: flex;
   flex-wrap: wrap;
@@ -242,6 +253,18 @@ body {
   background: var(--primary);
   color: white;
   border-color: var(--primary);
+}
+
+/* Ensure clicks on icons/dots inside pills always trigger the pill */
+.filter-pill i,
+.filter-pill .dot,
+.filter-pill span {
+  pointer-events: none;
+}
+
+.filter-pill:active {
+  transform: scale(0.95);
+  transition: transform 0.05s;
 }
 
 .dot {
