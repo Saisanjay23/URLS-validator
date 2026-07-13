@@ -1256,12 +1256,26 @@ async def _check_generic(session: aiohttp.ClientSession, url: str) -> dict:
     try:
         result = await _fetch_smart(session, url, "desktop")
         status, html = result["status"], result["html"]
-        title = _title(html)
-        h1 = _h1(html)
-        og = _og_title(html)
         final_url = result["final_url"]
         hops = result["hops"]
         cross_domain = result["cross_domain"]
+
+        # ── Enterprise Enhancement: TLS Spoofing Fallback for WAF Blocks ──
+        if status in (401, 403, 429, 999) and HAS_CURL_CFFI:
+            try:
+                async with CurlCffiAsyncSession(impersonate="chrome120") as curl_session:
+                    curl_res = await curl_session.get(url, timeout=10, allow_redirects=True)
+                    if curl_res.status_code != status:
+                        logger.info(f"[GENERIC] curl_cffi bypassed WAF for {url} (status {status} -> {curl_res.status_code})")
+                        status = curl_res.status_code
+                        html = curl_res.text
+                        final_url = str(curl_res.url)
+            except Exception as e:
+                logger.warning(f"[GENERIC] curl_cffi fallback failed for {url}: {e}")
+
+        title = _title(html)
+        h1 = _h1(html)
+        og = _og_title(html)
         content_len = len(html)
 
         # Step 2: Redirect chain analysis
@@ -1270,7 +1284,7 @@ async def _check_generic(session: aiohttp.ClientSession, url: str) -> dict:
             # Check if redirected to a known parking/error domain
             parking_domains = ["sedoparking.com", "bodis.com", "hugedomains.com", "afternic.com", "dan.com"]
             if any(pd in final_host for pd in parking_domains):
-                return {"status": "taken_down", "reason": f"Redirects to parking page ({final_host})", "http_code": status}
+                return {"status": "uncertain", "reason": f"Redirects to parking page ({final_host})", "http_code": status}
 
         # Step 3: HTTP status analysis
         if status in (404, 410):
@@ -1289,7 +1303,7 @@ async def _check_generic(session: aiohttp.ClientSession, url: str) -> dict:
         # Step 4: Parking/seized detection
         parking_reason = _detect_parking(html, title, h1)
         if parking_reason:
-            return {"status": "taken_down", "reason": parking_reason, "http_code": status}
+            return {"status": "uncertain", "reason": parking_reason, "http_code": status}
 
         # Step 5: Title/H1 takedown signals
         text_to_check = f"{title} {h1}".lower()
