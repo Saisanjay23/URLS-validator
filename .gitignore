@@ -1,0 +1,27 @@
+# Python virtual environment and cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+ENV/
+.pytest_cache/
+
+# Local configuration/credentials
+cookies.json
+*.local
+
+# Logs and databases
+*.log
+*.sqlite
+
+# IDE configuration files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
