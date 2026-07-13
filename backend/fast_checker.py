@@ -139,7 +139,7 @@ _TAKEDOWN_SIGNALS = [
     "web page not available",
 ]
 
-# Known domain parking / seized indicators
+# Known domain parking / seized / web host placeholder indicators
 _PARKING_SIGNALS = [
     "this domain is for sale",
     "buy this domain",
@@ -157,6 +157,21 @@ _PARKING_SIGNALS = [
     "afternic",
     "dan.com",
     "undeveloped.com",
+    "index of /",
+    "apache2 ubuntu default page",
+    "welcome to nginx",
+    "iis7",
+    "iis8",
+    "iis windows server",
+    "under construction",
+    "site under construction",
+    "coming soon",
+    "domain is ready",
+    "website is suspended",
+    "account suspended",
+    "default web site page",
+    "cpanel default page",
+    "placeholder page",
 ]
 
 # HTTP status codes that mean the server is alive but blocking us
@@ -231,6 +246,22 @@ def _is_dns_error(error: aiohttp.ClientConnectorError) -> bool:
     """Return True if the connection error is a DNS resolution failure."""
     msg = str(error).lower()
     return "getaddrinfo" in msg or "nodename" in msg
+
+
+def _classify_connection_error(e: Exception) -> str:
+    """Classify connection exceptions to extract clear reasons."""
+    msg = str(e).lower()
+    if "getaddrinfo" in msg or "nodename" in msg:
+        return "Domain/DNS not found"
+    if "refused" in msg:
+        return "Connection refused (server is offline)"
+    if "timed out" in msg or "timeout" in msg:
+        return "Connection timed out"
+    if "reset" in msg or "broken pipe" in msg:
+        return "Connection reset by peer"
+    if "ssl" in msg:
+        return "SSL handshake failure / secure connection error"
+    return f"Connection failed: {type(e).__name__}"
 
 
 # ── DNS Pre-Check ─────────────────────────────────────────────────────────────
@@ -1238,7 +1269,15 @@ async def _check_generic(session: aiohttp.ClientSession, url: str) -> dict:
         # Step 3: HTTP status analysis
         if status in (404, 410):
             return {"status": "taken_down", "reason": f"Page not found ({status})", "http_code": status}
-        if status >= 400 and status not in _ALIVE_ERROR_CODES:
+        if status == 451:
+            return {"status": "taken_down", "reason": "Unavailable for legal reasons (451)", "http_code": status}
+        if status in (401, 403):
+            return {"status": "uncertain", "reason": f"Access denied / Forbidden ({status})", "http_code": status}
+        if status == 429:
+            return {"status": "uncertain", "reason": "Rate limited (429)", "http_code": status}
+        if status in (502, 503, 504):
+            return {"status": "taken_down", "reason": f"Service offline / Server error ({status})", "http_code": status}
+        if status >= 400:
             return {"status": "taken_down", "reason": f"HTTP error ({status})", "http_code": status}
 
         # Step 4: Parking/seized detection
@@ -1268,11 +1307,12 @@ async def _check_generic(session: aiohttp.ClientSession, url: str) -> dict:
         return {"status": "active", "reason": f"Page is accessible ({detail})", "http_code": status}
 
     except aiohttp.ClientConnectorError as e:
-        if _is_dns_error(e):
-            return {"status": "taken_down", "reason": "Domain/DNS not found", "http_code": None}
-        return {"status": "active", "reason": "Active (Connection Blocked/SSL)", "http_code": None}
+        err_reason = _classify_connection_error(e)
+        if err_reason in ("Domain/DNS not found", "Connection refused (server is offline)", "Connection timed out"):
+            return {"status": "taken_down", "reason": err_reason, "http_code": None}
+        return {"status": "uncertain", "reason": err_reason, "http_code": None}
     except asyncio.TimeoutError:
-        return {"status": "uncertain", "reason": "Timeout during check", "http_code": None}
+        return {"status": "taken_down", "reason": "Connection timed out (request timeout)", "http_code": None}
     except Exception as e:
         return {"status": "uncertain", "reason": f"Check error: {str(e)[:50]}", "http_code": None}
 
