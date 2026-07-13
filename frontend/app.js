@@ -303,6 +303,13 @@
         if (data.status !== "error") {
             allResults.push(data);
             appendRow(data);
+            
+            // Show export/copy buttons immediately so user doesn't have to wait for the whole run to finish
+            if (allResults.length > 0) {
+                exportBtn.style.display = "inline-flex";
+                exportZipBtn.style.display = "inline-flex";
+                copyBtn.style.display = "inline-flex";
+            }
         }
 
         // Progress
