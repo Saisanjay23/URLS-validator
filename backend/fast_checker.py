@@ -170,9 +170,6 @@ _PARKING_SIGNALS = [
     "iis7",
     "iis8",
     "iis windows server",
-    "under construction",
-    "site under construction",
-    "coming soon",
     "domain is ready",
     "website is suspended",
     "account suspended",
@@ -617,19 +614,21 @@ async def _anonymous_fb_check(session: aiohttp.ClientSession, url: str) -> str |
       None         — inconclusive
     """
     try:
+        from curl_cffi.requests import AsyncSession as CurlCffiAsyncSession
         headers = {
             "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
             "Accept": "text/html,application/xhtml+xml",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        async with session.get(
-            url, timeout=aiohttp.ClientTimeout(total=8), headers=headers,
-            allow_redirects=True
-        ) as resp:
-            html = await resp.text()
+        async with CurlCffiAsyncSession(impersonate="chrome120") as curl_session:
+            resp = await curl_session.get(
+                url, timeout=8, headers=headers,
+                allow_redirects=True
+            )
+            html = resp.text
             title = _title(html)
             og = _og_title(html)
-            status = resp.status
+            status = resp.status_code
             final_url = str(resp.url)
 
             # Real og:title or title = page exists
@@ -1289,9 +1288,9 @@ async def _check_generic(session: aiohttp.ClientSession, url: str) -> dict:
         if status == 429:
             return {"status": "uncertain", "reason": "Rate limited (429)", "http_code": status}
         if status in (502, 503, 504):
-            return {"status": "taken_down", "reason": f"Service offline / Server error ({status})", "http_code": status}
+            return {"status": "uncertain", "reason": f"Service offline / Server error ({status})", "http_code": status}
         if status >= 400:
-            return {"status": "taken_down", "reason": f"HTTP error ({status})", "http_code": status}
+            return {"status": "uncertain", "reason": f"HTTP error ({status})", "http_code": status}
 
         # Step 4: Parking/seized detection
         parking_reason = _detect_parking(html, title, h1)
@@ -1321,11 +1320,11 @@ async def _check_generic(session: aiohttp.ClientSession, url: str) -> dict:
 
     except aiohttp.ClientConnectorError as e:
         err_reason = _classify_connection_error(e)
-        if err_reason in ("Domain/DNS not found", "Connection refused (server is offline)", "Connection timed out"):
+        if err_reason in ("Domain/DNS not found", "Connection refused (server is offline)"):
             return {"status": "taken_down", "reason": err_reason, "http_code": None}
         return {"status": "uncertain", "reason": err_reason, "http_code": None}
     except asyncio.TimeoutError:
-        return {"status": "taken_down", "reason": "Connection timed out (request timeout)", "http_code": None}
+        return {"status": "uncertain", "reason": "Connection timed out (request timeout)", "http_code": None}
     except Exception as e:
         return {"status": "uncertain", "reason": f"Check error: {str(e)[:50]}", "http_code": None}
 
