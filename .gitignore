@@ -10,7 +10,6 @@ ENV/
 .pytest_cache/
 
 # Local configuration/credentials
-cookies.json
 *.local
 
 # Logs and databases
