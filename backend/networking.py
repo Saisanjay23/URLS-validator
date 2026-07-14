@@ -65,6 +65,14 @@ class CircuitBreaker:
         if not ENABLE_CIRCUIT_BREAKER:
             return False
 
+        # Exclude social media platforms from circuit breaker tripping
+        normalized = host.lower().removeprefix("www.").removeprefix("m.")
+        if normalized in {
+            "instagram.com", "facebook.com", "linkedin.com", "x.com", 
+            "twitter.com", "youtube.com", "youtu.be", "t.me", "telegram.me"
+        }:
+            return False
+
         async with self._lock:
             if host not in self._open_since:
                 return False
@@ -91,6 +99,14 @@ class CircuitBreaker:
     async def record_failure(self, host: str) -> None:
         """Record a failed request — may trip the circuit."""
         if not ENABLE_CIRCUIT_BREAKER:
+            return
+
+        # Exclude social media platforms from recording circuit breaker failures
+        normalized = host.lower().removeprefix("www.").removeprefix("m.")
+        if normalized in {
+            "instagram.com", "facebook.com", "linkedin.com", "x.com", 
+            "twitter.com", "youtube.com", "youtu.be", "t.me", "telegram.me"
+        }:
             return
 
         async with self._lock:

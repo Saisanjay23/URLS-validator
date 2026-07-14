@@ -1085,6 +1085,22 @@ async def _check_instagram(session: aiohttp.ClientSession, url: str) -> dict:
         except Exception:
             pass
 
+        # Tier 5: curl_cffi with TLS Spoofing (impersonate Chrome)
+        if HAS_CURL_CFFI:
+            try:
+                async with CurlCffiAsyncSession(impersonate="chrome120") as curl_session:
+                    curl_res = await curl_session.get(url, timeout=15, allow_redirects=True)
+                    curl_status = curl_res.status_code
+                    curl_html = curl_res.text
+                    curl_final_url = str(curl_res.url)
+                    
+                    analyzed = _analyze_ig(curl_status, curl_html, curl_final_url)
+                    if analyzed:
+                        logger.info(f"[INSTAGRAM] curl_cffi bypassed bot block for {url} ({analyzed['status']})")
+                        return analyzed
+            except Exception as e:
+                logger.warning(f"[INSTAGRAM] curl_cffi fallback failed for {url}: {e}")
+
         # All tiers exhausted
         return {"status": "uncertain", "reason": "Instagram blocked all verification methods", "http_code": None}
     except aiohttp.ClientConnectorError as e:
