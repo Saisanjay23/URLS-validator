@@ -527,33 +527,52 @@ async def _check_telegram(session: aiohttp.ClientSession, url: str) -> dict:
 
 def _extract_fb_id(url: str) -> str | None:
     """
-    Extract the numeric Facebook ID from any URL format.
+    Extract the numeric Facebook ID or username/identifier from any URL format.
     Supports:
       - /profile.php?id=123456
       - /p/PageName-123456/
       - /pages/Name/123456
       - Numeric-only paths like /123456
-    Returns None if no numeric ID can be extracted.
+      - Usernames like /Navimumbai24 or /ime.isaac.75
+    Returns None if no identifier can be extracted.
     """
     parsed = urlparse(url)
+    path = parsed.path.strip("/")
+    if not path:
+        return None
+
     # profile.php?id=123456
-    if "profile.php" in parsed.path:
+    if "profile.php" in path:
         from urllib.parse import parse_qs
         qs = parse_qs(parsed.query)
         fb_id = qs.get("id", [None])[0]
-        if fb_id and fb_id.isdigit():
+        if fb_id:
             return fb_id
-    # /p/PageName-123456/ or /pages/category/123456
-    path = parsed.path.rstrip("/")
-    # Try to find a trailing numeric ID in the last path segment
-    last_segment = path.split("/")[-1] if path else ""
-    # Pure numeric path segment
-    if last_segment.isdigit() and len(last_segment) > 5:
-        return last_segment
+
+    segments = path.split("/")
+    
+    # Try to find a purely numeric segment (e.g. /people/Name/123456)
+    for seg in segments:
+        if seg.isdigit() and len(seg) > 5:
+            return seg
+
     # Name-123456 pattern (used in /p/ URLs)
+    last_segment = segments[-1]
     m = re.search(r"-(\d{10,})$", last_segment)
     if m:
         return m.group(1)
+
+    # Standard username segment
+    common_system_paths = {
+        "pages", "groups", "events", "marketplace", "watch", "live",
+        "stories", "reels", "photo.php", "permalink.php", "story.php",
+        "photo", "share", "login", "signup", "rsrc.php"
+    }
+    
+    first_segment = segments[0]
+    if first_segment not in common_system_paths and not first_segment.startswith("rsrc.php"):
+        return first_segment
+
     return None
 
 
@@ -563,7 +582,7 @@ async def _graph_api_exists(session: aiohttp.ClientSession, url: str) -> bool | 
 
     Calls graph.facebook.com/{id} (no token needed for existence check).
     Returns:
-      True  — page EXISTS (error code 104: "access token required")
+      True  — page EXISTS (error code 104: "access token required" / 200: "valid app ID required")
       False — page GONE  (error code 100: "does not exist")
       None  — inconclusive (no numeric ID, network error, unexpected response)
     """
@@ -586,10 +605,9 @@ async def _graph_api_exists(session: aiohttp.ClientSession, url: str) -> bool | 
                 if error_code == 100:
                     # "Object does not exist" — page is GONE
                     return False
-                if error_code in (104, 190):
-                    # Banned, deactivated, or restricted profiles also return 104/190.
-                    # This signal is inconclusive; we cannot assume the page is active.
-                    return None
+                if error_code in (104, 190, 200):
+                    # Banned, deactivated, restricted, or requires app ID = EXISTS
+                    return True
                 # If we got actual data back (no error), page definitely exists
                 if "id" in data or "name" in data:
                     return True
@@ -869,6 +887,38 @@ async def _check_linkedin(session: aiohttp.ClientSession, url: str) -> dict:
         if result:
             return result
         
+        # Fallback to curl_cffi with TLS Spoofing (impersonate Chrome)
+        if HAS_CURL_CFFI:
+            try:
+                async with CurlCffiAsyncSession(impersonate="chrome120") as curl_session:
+                    curl_res = await curl_session.get(url, timeout=15, allow_redirects=True)
+                    curl_status = curl_res.status_code
+                    curl_html = curl_res.text
+                    curl_final_url = str(curl_res.url)
+                    
+                    if curl_status == 404:
+                        return {"status": "taken_down", "reason": "LinkedIn content not found (404, curl_cffi)", "http_code": 404}
+                    
+                    if "/authwall" in curl_final_url or "/login" in curl_final_url or "/signup" in curl_final_url:
+                        pass # inconclusive authwall
+                    else:
+                        curl_title = _title(curl_html)
+                        curl_og = _og_title(curl_html)
+                        curl_og_desc = _og_description(curl_html)
+                        
+                        if _has_person_name(curl_og) or _has_person_name(curl_title):
+                            name = re.sub(r"\s*\|\s*LinkedIn\s*$", "", curl_og or curl_title, flags=re.IGNORECASE).strip()
+                            detail = f" — {curl_og_desc[:60]}" if curl_og_desc and "linkedin" not in curl_og_desc.lower() else ""
+                            return {"status": "active", "reason": f"LinkedIn exists ({name[:50]}{detail}, curl_cffi)", "http_code": curl_status}
+                        
+                        if curl_title.lower() in ("linkedin", "") and not curl_og:
+                            return {"status": "taken_down", "reason": "LinkedIn content not found (curl_cffi)", "http_code": curl_status}
+                        
+                        if curl_title.strip() and curl_title.lower() not in ("linkedin", "sign up", "log in"):
+                            return {"status": "active", "reason": f"LinkedIn exists (title: {curl_title[:40]}, curl_cffi)", "http_code": curl_status}
+            except Exception as e:
+                logger.warning(f"[LINKEDIN] curl_cffi fallback failed for {url}: {e}")
+
         # All dedicated bot UAs failed — return uncertain
         return {"status": "uncertain", "reason": "LinkedIn blocked all bot UAs. Cookies required.", "http_code": 403}
     except asyncio.TimeoutError:
@@ -1206,6 +1256,18 @@ async def _check_x(session: aiohttp.ClientSession, url: str) -> dict:
                     return {"status": "taken_down", "reason": "X content not found (oEmbed 404)", "http_code": 404}
         except Exception:
             pass
+
+        # Fallback to curl_cffi with TLS Spoofing (impersonate Chrome)
+        if HAS_CURL_CFFI:
+            try:
+                async with CurlCffiAsyncSession(impersonate="chrome120") as curl_session:
+                    curl_res = await curl_session.get(url, timeout=15, allow_redirects=True)
+                    analyzed = _analyze_x(curl_res.status_code, curl_res.text, str(curl_res.url))
+                    if analyzed:
+                        logger.info(f"[X] curl_cffi bypassed block for {url} ({analyzed['status']})")
+                        return analyzed
+            except Exception as e:
+                logger.warning(f"[X] curl_cffi fallback failed for {url}: {e}")
 
         # All tiers exhausted
         return {"status": "uncertain", "reason": "X blocked all verification methods", "http_code": None}
