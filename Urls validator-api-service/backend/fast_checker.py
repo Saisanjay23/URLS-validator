@@ -605,9 +605,12 @@ async def _graph_api_exists(session: aiohttp.ClientSession, url: str) -> bool | 
                 if error_code == 100:
                     # "Object does not exist" — page is GONE
                     return False
-                if error_code in (104, 190, 200):
-                    # Banned, deactivated, restricted, or requires app ID = EXISTS
+                if error_code == 200:
+                    # "Provide valid app ID" on usernames means page exists but requires login / auth
                     return True
+                if error_code in (104, 190):
+                    # Access token required / OAuthException is inconclusive for existence
+                    return None
                 # If we got actual data back (no error), page definitely exists
                 if "id" in data or "name" in data:
                     return True
