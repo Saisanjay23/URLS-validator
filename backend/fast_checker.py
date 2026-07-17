@@ -23,47 +23,73 @@ Techniques used (all free, no APIs, no cookies, no browser):
 import asyncio
 import io
 import ipaddress
+import json
 import random
 import re
 import socket
 import time
 import zipfile
-from pathlib import Path
 from typing import AsyncGenerator
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import aiohttp
 
 try:
-    from curl_cffi.requests import AsyncSession as CurlCffiAsyncSession
+    from curl_cffi import requests as curl_requests
     HAS_CURL_CFFI = True
 except ImportError:
     HAS_CURL_CFFI = False
 
+async def _curl_cffi_get(
+    url: str,
+    headers: dict | None = None,
+    impersonate: str = "chrome120",
+    timeout: float = 10.0,
+    allow_redirects: bool = True
+):
+    """
+    Thread-safe wrapper for curl_cffi requests.get to avoid Proactor event loop errors on Windows.
+    """
+    if not HAS_CURL_CFFI:
+        raise ImportError("curl_cffi is not installed")
+    return await asyncio.to_thread(
+        curl_requests.get,
+        url,
+        headers=headers,
+        impersonate=impersonate,
+        timeout=timeout,
+        allow_redirects=allow_redirects
+    )
+
 from backend.url_utils import detect_platform, normalize_url, deduplicate_urls
 from backend.logger import get_logger, log_check_result
+from backend.cookies import get_cookie_header_string, load_all_cookies
 
 # ── Enterprise Module Imports ─────────────────────────────────────────────────
 from backend import config
 from backend.evidence import Evidence
 from backend.confidence import compute_confidence
-from backend.html_parser import parse_html
-from backend.parking import detect_expanded_parking, is_parking_domain
-from backend.intelligence import (
-    detect_infrastructure,
-    classify_redirect_chain,
-    classify_error,
-)
-from backend.networking import (
-    circuit_breaker,
-    rate_limiter,
-    should_retry,
-    compute_backoff_delay,
-    resolve_dns,
-)
+from backend.parking import detect_expanded_parking
+from backend.intelligence import classify_error
+from backend.networking import circuit_breaker, rate_limiter
 from backend.metrics import metrics_collector, CheckMetric
 
 logger = get_logger()
+
+def _clean_html_text(html: str) -> str:
+    """Strip script, style, and metadata tags from HTML to inspect only visible text."""
+    try:
+        from selectolax.parser import HTMLParser
+        tree = HTMLParser(html)
+        for tag in ("script", "style", "template", "noscript", "head"):
+            for element in tree.css(tag):
+                element.decompose()
+        return (tree.body.text() if tree.body else tree.text()).lower()
+    except Exception:
+        # Fallback to regex cleaning if selectolax fails
+        cleaned = re.sub(r"<(script|style|template|noscript|head)[^>]*>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        return cleaned.lower()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -176,6 +202,10 @@ _PARKING_SIGNALS = [
     "default web site page",
     "cpanel default page",
     "placeholder page",
+    "hostinger dns system",
+    "parked domain name on hostinger dns system",
+    "hostinger",
+    "parked domain",
 ]
 
 # HTTP status codes that mean the server is alive but blocking us
@@ -196,40 +226,28 @@ def _h1(html: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def _og_title(html: str) -> str:
-    """Extract og:title from <meta> tags."""
+def _og_meta(html: str, prop: str) -> str:
+    """Extract an og:* property from <meta> tags (content before or after the property)."""
     for pattern in (
-        r'<meta\s+(?:property|name)=["\']og:title["\']\s+content=["\']([^"\']*)["\']',
-        r'content=["\']([^"\']*?)["\'](?:\s+(?:property|name)=["\']og:title["\'])',
+        rf'<meta\s+(?:property|name)=["\']og:{prop}["\']\s+content=["\']([^"\']*)["\']',
+        rf'content=["\']([^"\']*?)["\'](?:\s+(?:property|name)=["\']og:{prop}["\'])',
     ):
         m = re.search(pattern, html, re.IGNORECASE)
         if m:
             return m.group(1).strip()
     return ""
+
+
+def _og_title(html: str) -> str:
+    return _og_meta(html, "title")
 
 
 def _og_description(html: str) -> str:
-    """Extract og:description from <meta> tags."""
-    for pattern in (
-        r'<meta\s+(?:property|name)=["\']og:description["\']\s+content=["\']([^"\']*)["\']',
-        r'content=["\']([^"\']*?)["\'](?:\s+(?:property|name)=["\']og:description["\'])',
-    ):
-        m = re.search(pattern, html, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return ""
+    return _og_meta(html, "description")
 
 
 def _og_url(html: str) -> str:
-    """Extract og:url from <meta> tags."""
-    for pattern in (
-        r'<meta\s+(?:property|name)=["\']og:url["\']\s+content=["\']([^"\']*)["\']',
-        r'content=["\']([^"\']*?)["\'](?:\s+(?:property|name)=["\']og:url["\'])',
-    ):
-        m = re.search(pattern, html, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return ""
+    return _og_meta(html, "url")
 
 
 def _canonical(html: str) -> str:
@@ -291,7 +309,7 @@ async def _dns_resolve(hostname: str) -> bool:
     Fast async DNS check using socket.getaddrinfo in a thread.
     Returns True if the domain resolves, False if DNS fails.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         await asyncio.wait_for(
             loop.run_in_executor(None, socket.getaddrinfo, hostname, 443),
@@ -333,12 +351,9 @@ async def _fetch_with_redirect_chain(
                     location = r.headers.get("Location", "")
                     if not location:
                         break
-                    # Handle relative redirects
-                    if location.startswith("/"):
-                        parsed = urlparse(current_url)
-                        location = f"{parsed.scheme}://{parsed.netloc}{location}"
+                    # urljoin handles absolute, relative, and protocol-relative Locations
                     redirect_chain.append(current_url)
-                    current_url = location
+                    current_url = urljoin(current_url, location)
                     continue
                 else:
                     html = await r.text()
@@ -383,6 +398,7 @@ async def _fetch_smart(
     """
     ua_pools = [ua_pool, "mobile", "bot"] if ua_pool == "desktop" else [ua_pool, "desktop"]
     last_error = None
+    blocked_result = None
 
     for pool in ua_pools:
         headers = {
@@ -403,9 +419,9 @@ async def _fetch_smart(
                 # If we got a real response (not a 403/429 block), return it
                 if result["status"] not in (403, 429):
                     return result
-                else:
-                    logger.warning(f"IP Rate Limited or Bot Blocked ({result['status']}) on {url} (Pool: {pool}, Attempt: {attempt+1})")
 
+                logger.warning(f"IP Rate Limited or Bot Blocked ({result['status']}) on {url} (Pool: {pool}, Attempt: {attempt+1})")
+                blocked_result = result
                 # If blocked, try next UA pool
                 break
             except aiohttp.ClientConnectorError as e:
@@ -419,8 +435,8 @@ async def _fetch_smart(
 
     if last_error:
         raise last_error
-    if 'result' in locals():
-        return result
+    if blocked_result is not None:
+        return blocked_result
     raise Exception("All fetch strategies exhausted")
 
 
@@ -516,9 +532,9 @@ async def _check_telegram(session: aiohttp.ClientSession, url: str) -> dict:
             return {"status": "taken_down", "reason": "Domain/DNS not found", "http_code": None}
         return {"status": "active", "reason": "Active (Connection Blocked/SSL)", "http_code": None}
     except asyncio.TimeoutError:
-        return {"status": "uncertain", "reason": "Timeout during Facebook check", "http_code": None}
+        return {"status": "uncertain", "reason": "Timeout during Telegram check", "http_code": None}
     except Exception as e:
-        return {"status": "uncertain", "reason": f"Facebook check error: {str(e)[:50]}", "http_code": None}
+        return {"status": "uncertain", "reason": f"Telegram check error: {str(e)[:50]}", "http_code": None}
 
 # ── Facebook Cross-Verification Helpers ──────────────────────────────────────
 # These implement the multi-engine consensus architecture used by industry
@@ -543,14 +559,24 @@ def _extract_fb_id(url: str) -> str | None:
 
     # profile.php?id=123456
     if "profile.php" in path:
-        from urllib.parse import parse_qs
         qs = parse_qs(parsed.query)
         fb_id = qs.get("id", [None])[0]
         if fb_id:
             return fb_id
 
     segments = path.split("/")
-    
+
+    # Sub-content URLs (posts/photos/videos/reels): the Graph-checkable id
+    # would be the OWNER, not the content itself — verifying the owner exists
+    # says nothing about whether the post was removed. Return None so the
+    # caller falls back to multi-engine consensus instead.
+    _subcontent = {
+        "posts", "photo", "photos", "video", "videos", "reel", "reels",
+        "story.php", "permalink.php", "photo.php", "watch", "share", "live",
+    }
+    if any(seg in _subcontent for seg in segments):
+        return None
+
     # Try to find a purely numeric segment (e.g. /people/Name/123456)
     for seg in segments:
         if seg.isdigit() and len(seg) > 5:
@@ -578,17 +604,28 @@ def _extract_fb_id(url: str) -> str | None:
 
 async def _graph_api_exists(session: aiohttp.ClientSession, url: str) -> bool | None:
     """
-    Check if a Facebook page/profile exists using the Graph API.
+    Anonymous Graph API existence check — graph.facebook.com/{id}, no token.
 
-    Calls graph.facebook.com/{id} (no token needed for existence check).
-    Returns:
-      True  — page EXISTS (error code 104: "access token required" / 200: "valid app ID required")
-      False — page GONE  (error code 100: "does not exist")
-      None  — inconclusive (no numeric ID, network error, unexpected response)
+    Empirically verified behavior (probed 2026-07):
+      code 200 "provide valid app ID"   -> object EXISTS
+      code 100 on a NUMERIC id          -> object GONE (deleted id=1 -> 100)
+      code 100 on a username            -> AMBIGUOUS (live usernames like /zuck also return 100)
+      code 803 alias does not exist     -> object GONE
+      code 104 "access token required":
+        - on a /groups/ or /events/ id  -> object EXISTS (private group/event;
+          verified live: private group 430017090388013 -> 104)
+        - on a PROFILE id               -> MEANINGLESS: modern profile ids
+          (615.../1000...) return 104 whether the account exists or was
+          removed (verified against 27 known-taken-down profiles), so it must
+          never rescue a dead-looking profile.
+    Returns True (exists) / False (gone) / None (inconclusive).
     """
     fb_id = _extract_fb_id(url)
     if not fb_id:
         return None
+
+    path_lower = urlparse(url).path.lower()
+    is_group_or_event = "/groups/" in path_lower or "/events/" in path_lower
 
     try:
         graph_url = f"https://graph.facebook.com/{fb_id}"
@@ -596,187 +633,239 @@ async def _graph_api_exists(session: aiohttp.ClientSession, url: str) -> bool | 
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/json",
         }
-        async with session.get(graph_url, timeout=aiohttp.ClientTimeout(total=5), headers=headers) as resp:
+        async with session.get(graph_url, timeout=aiohttp.ClientTimeout(total=6), headers=headers) as resp:
             body = await resp.text()
-            try:
-                import json
-                data = json.loads(body)
-                error_code = data.get("error", {}).get("code")
-                if error_code == 100:
-                    # "Object does not exist" — page is GONE
-                    return False
-                if error_code == 200:
-                    # "Provide valid app ID" on usernames means page exists but requires login / auth
-                    return True
-                if error_code in (104, 190):
-                    # Access token required / OAuthException is inconclusive for existence
-                    return None
-                # If we got actual data back (no error), page definitely exists
-                if "id" in data or "name" in data:
-                    return True
-            except Exception:
-                pass
+        try:
+            data = json.loads(body)
+        except Exception:
             return None
+        error = data.get("error")
+        if not error:
+            # Real data back means the object is public and exists
+            return True if ("id" in data or "name" in data) else None
+        code = error.get("code")
+        if code == 200:
+            return True
+        if code == 104:
+            return True if is_group_or_event else None
+        if code == 803:
+            return False
+        if code == 100:
+            return False if fb_id.isdigit() else None
+        return None
     except Exception:
         return None
 
 
-async def _anonymous_fb_check(session: aiohttp.ClientSession, url: str) -> str | None:
-    """
-    Secondary anonymous verification using FacebookExternalHit bot UA.
+# Phrases Facebook renders on removed/nonexistent content. These alone are NOT
+# proof of removal — private groups and restricted content show them too —
+# which is why every "dead vote" is arbitrated against the Graph API below.
+_FB_TAKEDOWN_PHRASES = (
+    "this content isn't available right now",
+    "content isn't available",
+    "this page isn't available",
+    "page isn't available",
+    "this page has been removed",
+    "the link you followed may be broken",
+    "profile isn't available",
+)
 
-    This UA gets special treatment from Facebook (used for link previews).
-    Facebook serves og:title and og:description to this bot even for pages
-    that show login walls to regular browsers.
 
-    Returns:
-      "active"     — page has real og:title/title (not generic)
-      "taken_down" — page shows takedown signals
-      None         — inconclusive
+def _fb_normalize(html: str) -> str:
+    """Lowercase + normalize apostrophe encodings so takedown phrases match."""
+    return (
+        html.replace("&#039;", "'")
+        .replace("&#x27;", "'")
+        .replace("\u2019", "'")
+        .lower()
+    )
+
+
+def _fb_is_wall(final_url: str, title: str) -> bool:
+    """True when the response is a login/checkpoint wall — never classify from it."""
+    fl = (final_url or "").lower()
+    tl = title.strip().lower()
+    return (
+        "/login" in fl
+        or "/checkpoint" in fl
+        or "/recover" in fl
+        or tl.startswith(("log in", "log into", "sign up"))
+        or "log in or sign up" in tl
+    )
+
+
+def _fb_classify(status: int, html: str, final_url: str, requested_url: str) -> tuple[str, str] | None:
     """
-    try:
-        from curl_cffi.requests import AsyncSession as CurlCffiAsyncSession
+    Classify one anonymous Facebook response.
+
+    Empirically verified (probed 2026-07 with known live/dead URLs):
+      - Live pages/profiles/groups ALWAYS carry an og:title meta — even
+        facebook.com/facebook, whose og:title is literally "Facebook".
+      - Removed/nonexistent content has NO og:title at all, plus a
+        "content isn't available" phrase, or bounces to the bare homepage.
+      - Dead /watch videos bounce to the "Discover popular videos" hub.
+
+    Returns ("active", reason), ("dead_vote", reason) — dead votes require
+    Graph arbitration before becoming taken_down — or None when the response
+    is a wall/challenge and must not be classified.
+    """
+    if status in (404, 410):
+        return ("dead_vote", f"HTTP {status}")
+    if status in (403, 429) or status >= 500:
+        return None
+
+    title = _title(html)
+    og = _og_title(html)
+    if _fb_is_wall(final_url, title):
+        return None
+
+    og_stripped = og.strip()
+
+    # Dead /watch videos redirect to the generic video hub
+    if "/watch" in urlparse(requested_url).path.lower() and og_stripped:
+        if "discover popular videos" in og_stripped.lower():
+            return ("dead_vote", "video redirected to generic video hub")
+        return ("active", f"Facebook video is active ({og_stripped[:50]})")
+
+    # og:title present == the object resolved and rendered
+    if og_stripped:
+        return ("active", f"Facebook is active ({og_stripped[:50]})")
+
+    norm = _fb_normalize(html)
+    phrase = next((p for p in _FB_TAKEDOWN_PHRASES if p in norm), None)
+    if phrase:
+        return ("dead_vote", "matched: " + phrase)
+
+    # Requested a specific object but landed on the bare facebook.com homepage
+    req_path = urlparse(requested_url).path.strip("/")
+    fin = urlparse(final_url)
+    if req_path and not fin.path.strip("/") and not fin.query:
+        return ("dead_vote", "redirected to Facebook homepage")
+
+    return None
+
+
+async def _check_facebook(session: aiohttp.ClientSession, url: str) -> dict:
+    """
+    Facebook checker — cookie-free multi-engine consensus.
+
+    Engines, in order:
+      1. www.facebook.com with Chrome TLS impersonation (curl_cffi) — from a
+         normal network position this returns the FULL page anonymously.
+      2. facebookexternalhit crawler UA — Facebook serves OG previews to its
+         own link-preview bot even when browsers get challenged.
+      3. m.facebook.com via aiohttp UA rotation (weak fallback, mainly for
+         when curl_cffi is unavailable).
+
+    Decision rules (all empirically verified, see _fb_classify):
+      - Any engine seeing an og:title -> ACTIVE immediately.
+      - A dead-looking response is NEVER trusted alone: it is arbitrated
+        against the anonymous Graph API (private groups and restricted pages
+        show the same "content isn't available" interstitial).
+          Graph says exists  -> ACTIVE (restricted for anonymous view)
+          Graph says gone    -> TAKEN_DOWN (definitive for numeric ids)
+          Graph ambiguous    -> require a SECOND engine to independently see
+                                the takedown before declaring TAKEN_DOWN.
+      - Login/checkpoint walls are never classified; if everything walls,
+        the result is uncertain rather than a guess.
+    """
+
+    async def _engine_www():
+        resp = await _curl_cffi_get(url, impersonate="chrome120", timeout=12, allow_redirects=True)
+        return resp.status_code, resp.text, str(resp.url)
+
+    async def _engine_exthit():
         headers = {
             "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
             "Accept": "text/html,application/xhtml+xml",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        async with CurlCffiAsyncSession(impersonate="chrome120") as curl_session:
-            resp = await curl_session.get(
-                url, timeout=8, headers=headers,
-                allow_redirects=True
-            )
-            html = resp.text
-            title = _title(html)
-            og = _og_title(html)
-            status = resp.status_code
-            final_url = str(resp.url)
+        resp = await _curl_cffi_get(url, headers=headers, impersonate="chrome120", timeout=12, allow_redirects=True)
+        return resp.status_code, resp.text, str(resp.url)
 
-            # Real og:title or title = page exists
-            effective_title = og or title
-            title_lower = title.strip().lower()
-            
-            if effective_title.strip() and effective_title.strip().lower() not in ("facebook", ""):
-                return "active"
+    async def _engine_mobile():
+        check_url = url.replace("www.facebook.com", "m.facebook.com").replace(
+            "://facebook.com", "://m.facebook.com"
+        )
+        result = await _fetch_smart(session, check_url, "mobile")
+        return result["status"], result["html"], result["final_url"]
 
-            # Check for definitive takedown signals in the body
-            lower_html = html.lower()
-            takedown_signals = [
-                "content isn't available",
-                "page isn't available",
-                "this page has been removed",
-                "the link you followed may be broken",
-            ]
-            if any(sig in lower_html for sig in takedown_signals):
-                return "taken_down"
+    engines = []
+    if HAS_CURL_CFFI:
+        engines += [("www", _engine_www), ("exthit", _engine_exthit)]
+    engines.append(("mobile", _engine_mobile))
 
-            # A generic "Facebook" title with no takedown text is NOT evidence of
-            # removal: FB serves the same generic login wall for live pages
-            # (e.g. facebook.com/facebook) when it challenges anonymous/bot
-            # traffic. Only explicit takedown phrases above may confirm "down".
-            return None
-    except Exception:
-        return None
-
-
-async def _check_facebook(session: aiohttp.ClientSession, url: str) -> dict:
-    """
-    Facebook checker — Multi-Engine Cross-Verification Architecture.
-
-    Problem: A single check can produce false positives because Facebook returns
-    "content isn't available" for pages that are geo/age-restricted, not just
-    pages that are truly taken down.
-
-    Solution: 3-tier verification. We never declare "taken_down" from a single
-    signal. If the primary check says "down", we cross-verify with:
-      Tier 1: Facebook Graph API (error 104 = exists, 100 = gone)
-      Tier 2: Anonymous HTTP check (mobile endpoint, no cookies)
-
-    Only if MULTIPLE independent methods agree do we confirm "taken_down".
-    """
-    # ── Tier 0: Primary anonymous check (mobile, no cookies) ──
-    check_url = url.replace("www.facebook.com", "m.facebook.com").replace(
-        "://facebook.com", "://m.facebook.com"
-    )
+    graph_checked = False
+    graph_verdict: bool | None = None
+    dead_votes: list[str] = []
+    last_status = None
 
     try:
-        result = await _fetch_smart(session, check_url, "mobile")
-        status, html = result["status"], result["html"]
-        title = _title(html)
-        og_desc = _og_description(html)
+        for name, engine in engines:
+            try:
+                status, html, final_url = await engine()
+            except aiohttp.ClientConnectorError as e:
+                if _is_dns_error(e):
+                    return {"status": "taken_down", "reason": "Domain/DNS not found", "http_code": None}
+                continue
+            except Exception as e:
+                logger.warning(f"[FACEBOOK] engine {name} failed for {url}: {str(e)[:80]}")
+                continue
 
-        # ── Definitive positive signals (no cross-verification needed) ──
-        title_lower = title.strip().lower()
-        
-        # Real title (not generic "Facebook" and not login page) = definitively active
-        is_generic_title = title_lower in ("facebook", "error facebook") or not title.strip()
-        is_login_title = any(x in title_lower for x in ("log in", "login", "log into", "sign up", "signup"))
-        
-        if title.strip() and not is_generic_title and not is_login_title:
-            return {"status": "active", "reason": f"Facebook is active ({title[:50]})", "http_code": status}
+            last_status = status
+            verdict = _fb_classify(status, html, final_url, url)
+            if verdict is None:
+                logger.info(f"[FACEBOOK] engine {name} inconclusive (wall/challenge) for {url}")
+                continue
 
-        # ── Ambiguous/negative signals: cross-verify before declaring down ──
-        takedown_phrases = [
-            "content isn't available",
-            "this content isn't available",
-            "page isn't available",
-            "this page has been removed",
-            "the link you followed may be broken",
-        ]
-        primary_says_down = any(phrase in html.lower() for phrase in takedown_phrases)
-        primary_says_empty = is_generic_title
-        primary_says_login = is_login_title or "/login/" in result["final_url"]
+            kind, detail = verdict
+            if kind == "active":
+                return {"status": "active", "reason": f"{detail} [{name}]", "http_code": status}
 
-        if primary_says_down or primary_says_empty or primary_says_login:
-            # ── Tier 1: Graph API existence check ──
-            graph_exists = await _graph_api_exists(session, url)
-            if graph_exists is True:
-                return {"status": "active", "reason": "Facebook page exists (Graph API verified, restricted for anonymous view)", "http_code": status}
-            if graph_exists is False:
-                # Graph API confirms page does NOT exist — trust it
-                reason = "Facebook page not found (Graph API confirmed)"
-                if primary_says_down:
-                    for phrase in takedown_phrases:
-                        if phrase in html.lower():
-                            reason = f"Facebook: {phrase} (Graph API confirmed)"
-                            break
-                return {"status": "taken_down", "reason": reason, "http_code": status}
+            # Dead vote -> arbitrate with the Graph API (once per URL)
+            if not graph_checked:
+                graph_verdict = await _graph_api_exists(session, url)
+                graph_checked = True
+            if graph_verdict is True:
+                return {
+                    "status": "active",
+                    "reason": "Facebook object exists (Graph API verified) — restricted for anonymous view",
+                    "http_code": status,
+                }
+            if graph_verdict is False:
+                return {
+                    "status": "taken_down",
+                    "reason": f"Facebook content removed: {detail} (Graph API confirmed gone)",
+                    "http_code": status,
+                }
 
-            # ── Tier 2: Secondary anonymous check (FacebookExternalHit bot) ──
-            bot_result = await _anonymous_fb_check(session, url)
-            if bot_result == "active":
-                return {"status": "active", "reason": "Facebook page exists (bot UA verified, restricted for mobile view)", "http_code": status}
-            if bot_result == "taken_down":
-                reason = "Facebook page not found (multi-engine verified)"
-                if primary_says_down:
-                    for phrase in takedown_phrases:
-                        if phrase in html.lower():
-                            reason = f"Facebook: {phrase} (cross-verified)"
-                            break
-                return {"status": "taken_down", "reason": reason, "http_code": status}
+            dead_votes.append(f"{name}: {detail}")
+            if len(dead_votes) >= 2:
+                return {
+                    "status": "taken_down",
+                    "reason": f"Facebook content removed ({'; '.join(dead_votes)})",
+                    "http_code": status,
+                }
 
-            # A generic title with Graph API and bot check both inconclusive is a
-            # login wall / bot challenge, not evidence of removal — live pages
-            # (e.g. facebook.com/facebook) hit this path under anonymous access.
-            # Takedowns must be confirmed by explicit phrases or the Graph API.
-
-            # If it was redirected to a login wall, and bot/graph checks are inconclusive, return uncertain
-            if primary_says_login:
-                return {"status": "uncertain", "reason": "Facebook login wall encountered. Cookies required.", "http_code": status}
-
-            # Both cross-verification tiers inconclusive
-            return {"status": "uncertain", "reason": "Facebook verification inconclusive (login wall / challenge). Cookies required.", "http_code": status}
-
-        # Shouldn't reach here, but fallback
-        return {"status": "active", "reason": f"Facebook is active ({title[:50]})", "http_code": status}
+        if dead_votes:
+            return {
+                "status": "uncertain",
+                "reason": f"Possible Facebook takedown, unconfirmed ({dead_votes[0]}) — other engines blocked",
+                "http_code": last_status,
+            }
+        return {
+            "status": "uncertain",
+            "reason": "Facebook served walls/challenges to all anonymous engines",
+            "http_code": last_status,
+        }
     except aiohttp.ClientConnectorError as e:
         if _is_dns_error(e):
             return {"status": "taken_down", "reason": "Domain/DNS not found", "http_code": None}
-        return {"status": "active", "reason": "Active (Connection Blocked/SSL)", "http_code": None}
+        return {"status": "uncertain", "reason": "Connection blocked during Facebook check", "http_code": None}
     except asyncio.TimeoutError:
-        return {"status": "uncertain", "reason": "Timeout during Telegram check", "http_code": None}
+        return {"status": "uncertain", "reason": "Timeout during Facebook check", "http_code": None}
     except Exception as e:
-        return {"status": "uncertain", "reason": f"Telegram check error: {str(e)[:50]}", "http_code": None}
+        return {"status": "uncertain", "reason": f"Facebook check error: {str(e)[:50]}", "http_code": None}
 
 
 def _has_person_name(text: str) -> bool:
@@ -799,7 +888,6 @@ async def _check_linkedin(session: aiohttp.ClientSession, url: str) -> dict:
       Auth wall:  Redirects to login page (treated as uncertain for posts)
     """
     # Try with user cookies if configured
-    from backend.cookies import get_cookie_header_string
     cookie_str = get_cookie_header_string("linkedin")
     if cookie_str:
         logger.info(f"[LINKEDIN] Found cookies. Trying request using cookies...")
@@ -811,28 +899,28 @@ async def _check_linkedin(session: aiohttp.ClientSession, url: str) -> dict:
             "Connection": "keep-alive",
         }
         try:
-            async with session.get(url, timeout=_TIMEOUT, headers=headers, allow_redirects=True) as resp:
-                status = resp.status
-                html = await resp.text()
-                final_url = str(resp.url)
+            resp = await _curl_cffi_get(url, headers=headers, impersonate="chrome120", timeout=config.TIMEOUT_TOTAL, allow_redirects=True)
+            status = resp.status_code
+            html = resp.text
+            final_url = str(resp.url)
+
+            if status == 404:
+                return {"status": "taken_down", "reason": "LinkedIn content not found (404, Cookie)", "http_code": 404}
+            
+            if "/authwall" in final_url or "/login" in final_url or "/signup" in final_url:
+                logger.warning("[LINKEDIN] Cookie request redirected to login/authwall. Cookies might be expired. Falling back to bot rotation...")
+            else:
+                title = _title(html)
+                og = _og_title(html)
+                og_desc = _og_description(html)
                 
-                if status == 404:
-                    return {"status": "taken_down", "reason": "LinkedIn content not found (404, Cookie)", "http_code": 404}
+                if _has_person_name(og) or _has_person_name(title):
+                    name = re.sub(r"\s*\|\s*LinkedIn\s*$", "", og or title, flags=re.IGNORECASE).strip()
+                    detail = f" — {og_desc[:60]}" if og_desc and "linkedin" not in og_desc.lower() else ""
+                    return {"status": "active", "reason": f"LinkedIn exists ({name[:50]}{detail}, Cookie)", "http_code": status}
                 
-                if "/authwall" in final_url or "/login" in final_url or "/signup" in final_url:
-                    logger.warning("[LINKEDIN] Cookie request redirected to login/authwall. Cookies might be expired. Falling back to bot rotation...")
-                else:
-                    title = _title(html)
-                    og = _og_title(html)
-                    og_desc = _og_description(html)
-                    
-                    if _has_person_name(og) or _has_person_name(title):
-                        name = re.sub(r"\s*\|\s*LinkedIn\s*$", "", og or title, flags=re.IGNORECASE).strip()
-                        detail = f" — {og_desc[:60]}" if og_desc and "linkedin" not in og_desc.lower() else ""
-                        return {"status": "active", "reason": f"LinkedIn exists ({name[:50]}{detail}, Cookie)", "http_code": status}
-                    
-                    if title.lower() in ("linkedin", "") and not og:
-                        return {"status": "taken_down", "reason": "LinkedIn content not found (Cookie)", "http_code": status}
+                if title.lower() in ("linkedin", "") and not og:
+                    return {"status": "taken_down", "reason": "LinkedIn content not found (Cookie)", "http_code": status}
         except Exception as e:
             logger.warning(f"[LINKEDIN] Cookie request failed: {e}. Falling back to bot rotation...")
 
@@ -893,32 +981,29 @@ async def _check_linkedin(session: aiohttp.ClientSession, url: str) -> dict:
         # Fallback to curl_cffi with TLS Spoofing (impersonate Chrome)
         if HAS_CURL_CFFI:
             try:
-                async with CurlCffiAsyncSession(impersonate="chrome120") as curl_session:
-                    curl_res = await curl_session.get(url, timeout=15, allow_redirects=True)
-                    curl_status = curl_res.status_code
-                    curl_html = curl_res.text
-                    curl_final_url = str(curl_res.url)
+                curl_res = await _curl_cffi_get(url, impersonate="chrome120", timeout=15, allow_redirects=True)
+                curl_status = curl_res.status_code
+                curl_html = curl_res.text
+                curl_final_url = str(curl_res.url)
+                if curl_status == 404:
+                    return {"status": "taken_down", "reason": "LinkedIn content not found (404, curl_cffi)", "http_code": 404}
+                if "/authwall" in curl_final_url or "/login" in curl_final_url or "/signup" in curl_final_url:
+                    pass # inconclusive authwall
+                else:
+                    curl_title = _title(curl_html)
+                    curl_og = _og_title(curl_html)
+                    curl_og_desc = _og_description(curl_html)
                     
-                    if curl_status == 404:
-                        return {"status": "taken_down", "reason": "LinkedIn content not found (404, curl_cffi)", "http_code": 404}
+                    if _has_person_name(curl_og) or _has_person_name(curl_title):
+                        name = re.sub(r"\s*\|\s*LinkedIn\s*$", "", curl_og or curl_title, flags=re.IGNORECASE).strip()
+                        detail = f" — {curl_og_desc[:60]}" if curl_og_desc and "linkedin" not in curl_og_desc.lower() else ""
+                        return {"status": "active", "reason": f"LinkedIn exists ({name[:50]}{detail}, curl_cffi)", "http_code": curl_status}
                     
-                    if "/authwall" in curl_final_url or "/login" in curl_final_url or "/signup" in curl_final_url:
-                        pass # inconclusive authwall
-                    else:
-                        curl_title = _title(curl_html)
-                        curl_og = _og_title(curl_html)
-                        curl_og_desc = _og_description(curl_html)
-                        
-                        if _has_person_name(curl_og) or _has_person_name(curl_title):
-                            name = re.sub(r"\s*\|\s*LinkedIn\s*$", "", curl_og or curl_title, flags=re.IGNORECASE).strip()
-                            detail = f" — {curl_og_desc[:60]}" if curl_og_desc and "linkedin" not in curl_og_desc.lower() else ""
-                            return {"status": "active", "reason": f"LinkedIn exists ({name[:50]}{detail}, curl_cffi)", "http_code": curl_status}
-                        
-                        if curl_title.lower() in ("linkedin", "") and not curl_og:
-                            return {"status": "taken_down", "reason": "LinkedIn content not found (curl_cffi)", "http_code": curl_status}
-                        
-                        if curl_title.strip() and curl_title.lower() not in ("linkedin", "sign up", "log in"):
-                            return {"status": "active", "reason": f"LinkedIn exists (title: {curl_title[:40]}, curl_cffi)", "http_code": curl_status}
+                    if curl_title.lower() in ("linkedin", "") and not curl_og:
+                        return {"status": "taken_down", "reason": "LinkedIn content not found (curl_cffi)", "http_code": curl_status}
+                    
+                    if curl_title.strip() and curl_title.lower() not in ("linkedin", "sign up", "log in"):
+                        return {"status": "active", "reason": f"LinkedIn exists (title: {curl_title[:40]}, curl_cffi)", "http_code": curl_status}
             except Exception as e:
                 logger.warning(f"[LINKEDIN] curl_cffi fallback failed for {url}: {e}")
 
@@ -949,10 +1034,14 @@ async def _check_youtube(session: aiohttp.ClientSession, url: str) -> dict:
         # Normalize Shorts URLs to watch URLs before calling oEmbed
         target_url = url
         if "/shorts/" in url_lower:
-            target_url = url.replace("/shorts/", "/watch?v=")
-            
+            # Extract the bare video ID — a trailing query string would produce
+            # an invalid "watch?v=ID?feature=share" URL and a false 400.
+            m = re.search(r"/shorts/([A-Za-z0-9_-]+)", url)
+            if m:
+                target_url = f"https://www.youtube.com/watch?v={m.group(1)}"
+
         try:
-            oembed_url = f"https://www.youtube.com/oembed?url={target_url}&format=json"
+            oembed_url = f"https://www.youtube.com/oembed?url={quote(target_url, safe='')}&format=json"
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "Accept": "application/json"
@@ -960,7 +1049,6 @@ async def _check_youtube(session: aiohttp.ClientSession, url: str) -> dict:
             async with session.get(oembed_url, timeout=aiohttp.ClientTimeout(total=6), headers=headers) as resp:
                 status = resp.status
                 if status == 200:
-                    import json
                     data = json.loads(await resp.text())
                     title = data.get("title", "")
                     author = data.get("author_name", "")
@@ -1045,6 +1133,56 @@ async def _check_youtube(session: aiohttp.ClientSession, url: str) -> dict:
         return {"status": "uncertain", "reason": f"YouTube check error: {str(e)[:50]}", "http_code": None}
 
 
+async def _ig_api_check(url: str) -> dict | None:
+    """
+    Check Instagram profile status using the web_profile_info API endpoint.
+    Returns a result dict if definitive, otherwise None.
+    """
+    if not HAS_CURL_CFFI:
+        return None
+    try:
+        # Only profile URLs (single path segment) — post/reel/story URLs would
+        # send a shortcode as "username" and falsely report a suspended profile.
+        segments = [s for s in urlparse(url).path.split("/") if s]
+        if len(segments) != 1:
+            return None
+        path = segments[0]
+        if path in ("accounts", "developer", "explore", "about", "p", "reel", "reels", "tv", "stories"):
+            return None
+
+        api_url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={path}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "X-IG-App-ID": "936619743392459",
+            "Accept": "*/*",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        
+        resp = await _curl_cffi_get(api_url, headers=headers, impersonate="chrome120", timeout=10, allow_redirects=True)
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                user = data.get("data", {}).get("user")
+                if user:
+                    full_name = user.get("full_name") or "Instagram User"
+                    followers = user.get("edge_followed_by", {}).get("count") or 0
+                    privacy = "Private" if user.get("is_private") else "Public"
+                    return {
+                        "status": "active",
+                        "reason": f"Instagram is active ({full_name[:30]} · {privacy} · {followers} followers)",
+                        "http_code": 200
+                    }
+                else:
+                    if data.get("status") == "ok":
+                        return {"status": "taken_down", "reason": "Instagram profile suspended or disabled", "http_code": 200}
+            except Exception:
+                pass
+        elif resp.status_code == 404:
+            return {"status": "taken_down", "reason": "Instagram profile not found (404 API)", "http_code": 404}
+    except Exception as e:
+        logger.warning(f"[INSTAGRAM] API verification failed for {url}: {e}")
+    return None
+
 async def _check_instagram(session: aiohttp.ClientSession, url: str) -> dict:
     """
     Instagram checker — Multi-Bot-UA Sequential Verification.
@@ -1098,15 +1236,46 @@ async def _check_instagram(session: aiohttp.ClientSession, url: str) -> dict:
         if og_desc and ("followers" in og_desc.lower() or "posts" in og_desc.lower()):
             return {"status": "active", "reason": f"Instagram is active ({og_desc[:60]})", "http_code": status}
 
-        # Dead profile: title is exactly "Instagram" with no OG metadata
+        # Generic title "Instagram" with no OG metadata: inconclusive (login wall / challenge)
         if title.strip() == "Instagram" and not og:
-            return {"status": "taken_down", "reason": "Instagram profile not found", "http_code": status}
+            return None
 
         # Has a real title that's not just "Instagram"
         if title.strip() and title.strip() != "Instagram":
             return {"status": "active", "reason": f"Instagram is active ({title[:50]})", "http_code": status}
 
         return None  # Inconclusive
+
+    # Tier 0: Check using the official web_profile_info API endpoint
+    api_res = await _ig_api_check(url)
+    if api_res:
+        logger.info(f"[INSTAGRAM] API verification succeeded: status={api_res['status']}")
+        return api_res
+
+    # Try with user cookies if configured
+    cookie_str = get_cookie_header_string("instagram")
+    if cookie_str:
+        logger.info(f"[INSTAGRAM] Found cookies. Trying request using cookies...")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Cookie": cookie_str,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        try:
+            resp = await _curl_cffi_get(url, headers=headers, impersonate="chrome120", timeout=config.TIMEOUT_TOTAL, allow_redirects=True)
+            status = resp.status_code
+            html = resp.text
+            final_url = str(resp.url)
+
+            result = _analyze_ig(status, html, final_url)
+            if result:
+                logger.info(f"[INSTAGRAM] Cookie check succeeded: status={result['status']}")
+                return result
+            if "/accounts/login/" in final_url or status in (403, 429):
+                logger.warning("[INSTAGRAM] Cookie request redirected to login. Cookies might be expired. Falling back to bot UAs...")
+        except Exception as ce:
+            logger.warning(f"[INSTAGRAM] Cookie request failed: {ce}. Falling back to bot UAs...")
 
     try:
         # Tier 1-3: Try multiple bot UAs sequentially
@@ -1141,16 +1310,15 @@ async def _check_instagram(session: aiohttp.ClientSession, url: str) -> dict:
         # Tier 5: curl_cffi with TLS Spoofing (impersonate Chrome)
         if HAS_CURL_CFFI:
             try:
-                async with CurlCffiAsyncSession(impersonate="chrome120") as curl_session:
-                    curl_res = await curl_session.get(url, timeout=15, allow_redirects=True)
-                    curl_status = curl_res.status_code
-                    curl_html = curl_res.text
-                    curl_final_url = str(curl_res.url)
-                    
-                    analyzed = _analyze_ig(curl_status, curl_html, curl_final_url)
-                    if analyzed:
-                        logger.info(f"[INSTAGRAM] curl_cffi bypassed bot block for {url} ({analyzed['status']})")
-                        return analyzed
+                curl_headers = {"Cookie": cookie_str} if cookie_str else None
+                curl_res = await _curl_cffi_get(url, headers=curl_headers, impersonate="chrome120", timeout=15, allow_redirects=True)
+                curl_status = curl_res.status_code
+                curl_html = curl_res.text
+                curl_final_url = str(curl_res.url)
+                analyzed = _analyze_ig(curl_status, curl_html, curl_final_url)
+                if analyzed:
+                    logger.info(f"[INSTAGRAM] curl_cffi bypassed bot block for {url} ({analyzed['status']})")
+                    return analyzed
             except Exception as e:
                 logger.warning(f"[INSTAGRAM] curl_cffi fallback failed for {url}: {e}")
 
@@ -1245,11 +1413,10 @@ async def _check_x(session: aiohttp.ClientSession, url: str) -> dict:
         # Tier 3: oEmbed API — free, official, no auth required
         # Works for tweets and profiles. Returns 200+JSON if content exists, 404 if not.
         try:
-            oembed_url = f"https://publish.twitter.com/oembed?url={url}&omit_script=true"
+            oembed_url = f"https://publish.twitter.com/oembed?url={quote(url, safe='')}&omit_script=true"
             headers = {"User-Agent": _random_ua("desktop"), "Accept": "application/json"}
             async with session.get(oembed_url, timeout=aiohttp.ClientTimeout(total=8), headers=headers) as resp:
                 if resp.status == 200:
-                    import json
                     data = json.loads(await resp.text())
                     author = data.get("author_name", "")
                     if author:
@@ -1263,12 +1430,11 @@ async def _check_x(session: aiohttp.ClientSession, url: str) -> dict:
         # Fallback to curl_cffi with TLS Spoofing (impersonate Chrome)
         if HAS_CURL_CFFI:
             try:
-                async with CurlCffiAsyncSession(impersonate="chrome120") as curl_session:
-                    curl_res = await curl_session.get(url, timeout=15, allow_redirects=True)
-                    analyzed = _analyze_x(curl_res.status_code, curl_res.text, str(curl_res.url))
-                    if analyzed:
-                        logger.info(f"[X] curl_cffi bypassed block for {url} ({analyzed['status']})")
-                        return analyzed
+                curl_res = await _curl_cffi_get(url, impersonate="chrome120", timeout=15, allow_redirects=True)
+                analyzed = _analyze_x(curl_res.status_code, curl_res.text, str(curl_res.url))
+                if analyzed:
+                    logger.info(f"[X] curl_cffi bypassed block for {url} ({analyzed['status']})")
+                    return analyzed
             except Exception as e:
                 logger.warning(f"[X] curl_cffi fallback failed for {url}: {e}")
 
@@ -1336,13 +1502,12 @@ async def _check_generic(session: aiohttp.ClientSession, url: str) -> dict:
         # ── Enterprise Enhancement: TLS Spoofing Fallback for WAF Blocks ──
         if status in (401, 403, 429, 999) and HAS_CURL_CFFI:
             try:
-                async with CurlCffiAsyncSession(impersonate="chrome120") as curl_session:
-                    curl_res = await curl_session.get(url, timeout=10, allow_redirects=True)
-                    if curl_res.status_code != status:
-                        logger.info(f"[GENERIC] curl_cffi bypassed WAF for {url} (status {status} -> {curl_res.status_code})")
-                        status = curl_res.status_code
-                        html = curl_res.text
-                        final_url = str(curl_res.url)
+                curl_res = await _curl_cffi_get(url, impersonate="chrome120", timeout=10, allow_redirects=True)
+                if curl_res.status_code != status:
+                    logger.info(f"[GENERIC] curl_cffi bypassed WAF for {url} (status {status} -> {curl_res.status_code})")
+                    status = curl_res.status_code
+                    html = curl_res.text
+                    final_url = str(curl_res.url)
             except Exception as e:
                 logger.warning(f"[GENERIC] curl_cffi fallback failed for {url}: {e}")
 
@@ -1357,7 +1522,7 @@ async def _check_generic(session: aiohttp.ClientSession, url: str) -> dict:
             # Check if redirected to a known parking/error domain
             parking_domains = ["sedoparking.com", "bodis.com", "hugedomains.com", "afternic.com", "dan.com"]
             if any(pd in final_host for pd in parking_domains):
-                return {"status": "uncertain", "reason": f"Redirects to parking page ({final_host})", "http_code": status}
+                return {"status": "taken_down", "reason": f"Redirects to parking page ({final_host})", "http_code": status}
 
         # Step 3: HTTP status analysis
         if status in (404, 410):
@@ -1365,7 +1530,10 @@ async def _check_generic(session: aiohttp.ClientSession, url: str) -> dict:
         if status == 451:
             return {"status": "taken_down", "reason": "Unavailable for legal reasons (451)", "http_code": status}
         if status in (401, 403):
-            return {"status": "uncertain", "reason": f"Access denied / Forbidden ({status})", "http_code": status}
+            title_lower = title.lower()
+            if any(x in title_lower for x in ("forbidden", "access denied", "403", "401", "unauthorized")) or not title.strip():
+                return {"status": "uncertain", "reason": f"Access denied / Forbidden ({status})", "http_code": status}
+            return {"status": "active", "reason": f"Active (restricted/protected: {status} · {title[:40]})", "http_code": status}
         if status == 429:
             return {"status": "uncertain", "reason": "Rate limited (429)", "http_code": status}
         if status in (502, 503, 504):
@@ -1376,7 +1544,7 @@ async def _check_generic(session: aiohttp.ClientSession, url: str) -> dict:
         # Step 4: Parking/seized detection
         parking_reason = _detect_parking(html, title, h1)
         if parking_reason:
-            return {"status": "uncertain", "reason": parking_reason, "http_code": status}
+            return {"status": "taken_down", "reason": parking_reason, "http_code": status}
 
         # Step 5: Title/H1 takedown signals
         text_to_check = f"{title} {h1}".lower()
@@ -1423,15 +1591,14 @@ async def _check_app_store(session: aiohttp.ClientSession, url: str) -> dict:
             if HAS_CURL_CFFI:
                 # Attempt to bypass Cloudflare / Anti-bot walls using TLS spoofing
                 try:
-                    async with CurlCffiAsyncSession(impersonate="chrome116") as curl_session:
-                        curl_res = await curl_session.get(url, timeout=10, allow_redirects=True)
-                        if curl_res.status_code == 200:
-                            status = 200
-                            html = curl_res.text
-                        elif curl_res.status_code in (404, 410):
-                            return {"status": "taken_down", "reason": f"App not found ({curl_res.status_code})", "http_code": curl_res.status_code}
-                        else:
-                            return {"status": "uncertain", "reason": f"Anti-bot wall / security challenge ({status}) [curl_cffi={curl_res.status_code}]", "http_code": status}
+                    curl_res = await _curl_cffi_get(url, impersonate="chrome116", timeout=10, allow_redirects=True)
+                    if curl_res.status_code == 200:
+                        status = 200
+                        html = curl_res.text
+                    elif curl_res.status_code in (404, 410):
+                        return {"status": "taken_down", "reason": f"App not found ({curl_res.status_code})", "http_code": curl_res.status_code}
+                    else:
+                        return {"status": "uncertain", "reason": f"Anti-bot wall / security challenge ({status}) [curl_cffi={curl_res.status_code}]", "http_code": status}
                 except Exception as curl_e:
                     return {"status": "uncertain", "reason": f"Anti-bot wall / security challenge ({status}) [curl_cffi error]", "http_code": status}
             else:
@@ -1466,6 +1633,112 @@ async def _check_app_store(session: aiohttp.ClientSession, url: str) -> dict:
     except Exception as e:
         return {"status": "uncertain", "reason": f"App check error: {str(e)[:50]}", "http_code": None}
 
+async def _scribd_oembed_check(session: aiohttp.ClientSession, url: str) -> dict | None:
+    """
+    Check Scribd document existence using the Cloudflare-free oEmbed API.
+    Returns a result dict if definitive, otherwise None.
+    """
+    clean_url = url.split("?")[0]
+    oembed_url = f"https://www.scribd.com/services/oembed?url={clean_url}&format=json"
+    try:
+        async with session.get(oembed_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status == 200:
+                try:
+                    data = await resp.json()
+                    title = data.get("title") or "Document"
+                    return {"status": "active", "reason": f"Scribd is active ({title[:50]})", "http_code": 200}
+                except Exception:
+                    return {"status": "active", "reason": "Scribd is active (oEmbed verified)", "http_code": 200}
+            elif resp.status == 401:
+                return {"status": "taken_down", "reason": "Scribd content not found / private (401 oEmbed)", "http_code": 401}
+            elif resp.status in (404, 410):
+                return {"status": "taken_down", "reason": f"Scribd content not found ({resp.status} oEmbed)", "http_code": resp.status}
+    except Exception as e:
+        logger.warning(f"[SCRIBD] oEmbed API check failed: {e}")
+    return None
+
+async def _check_scribd(session: aiohttp.ClientSession, url: str) -> dict:
+    """
+    Check Scribd URLs (documents, presentations, books, authors, users).
+    Uses browser impersonation curl_cffi by default since Scribd heavily protects its pages with Cloudflare.
+    """
+    try:
+        # Strip query parameters to bypass tracking-based Cloudflare challenges
+        if "?" in url:
+            url = url.split("?")[0]
+
+        # Tier 1: Try the oEmbed API (Cloudflare-free)
+        oembed_res = await _scribd_oembed_check(session, url)
+        if oembed_res:
+            return oembed_res
+
+        # We start with curl_cffi since it is much more accurate for Cloudflare-protected sites.
+        if HAS_CURL_CFFI:
+            try:
+                resp = await _curl_cffi_get(url, impersonate="chrome120", timeout=12, allow_redirects=True)
+                status = resp.status_code
+                html = resp.text
+                final_url = str(resp.url)
+            except Exception as e:
+                # If curl_cffi fails, fallback to standard session fetch
+                result = await _fetch_smart(session, url, "desktop")
+                status, html = result["status"], result["html"]
+                final_url = url
+        else:
+            result = await _fetch_smart(session, url, "desktop")
+            status, html = result["status"], result["html"]
+            final_url = url
+
+        # Let's analyze status and html content
+        if status in (404, 406, 410):
+            return {"status": "taken_down", "reason": f"Scribd content not found ({status})", "http_code": status}
+
+        if status in (401, 403, 429, 503, 999):
+            return {"status": "uncertain", "reason": f"Scribd login wall / Cloudflare challenge ({status})", "http_code": status}
+
+        # Success check
+        html_lower = html.lower()
+        title_val = _title(html)
+        title_lower = title_val.lower()
+
+        # Check for Cloudflare / DDoS wall text or challenge titles
+        if "challenge" in title_lower or "cloudflare" in html_lower or "just a moment..." in html_lower or "please wait..." in html_lower:
+            return {"status": "uncertain", "reason": "Scribd Cloudflare challenge detected", "http_code": status}
+
+        # Check for non-existent / deleted pages or removal notice
+        takedown_indicators = [
+            "page not found",
+            "document removed",
+            "removal notice",
+            "this document has been removed",
+            "we're sorry, we can't find this document",
+            "scribd - document removed",
+        ]
+        
+        if any(p in html_lower for p in takedown_indicators) or any(p in title_lower for p in ("page not found", "removal notice")):
+            return {"status": "taken_down", "reason": "Scribd content not found / removed", "http_code": status}
+
+        # If it returns standard Scribd title but is not page not found
+        if title_val and "scribd" in title_lower and not any(p in title_lower for p in ("page not found", "error", "challenge", "removal notice")):
+            clean_title = title_val.split("|")[0].strip()
+            return {"status": "active", "reason": f"Scribd is active ({clean_title[:50]})", "http_code": status}
+
+        # Fallback success check
+        if status == 200:
+            clean_title = title_val.split("|")[0].strip() if title_val else "Document"
+            return {"status": "active", "reason": f"Scribd is active ({clean_title[:50]})", "http_code": status}
+
+        return {"status": "uncertain", "reason": f"Unexpected status code {status}", "http_code": status}
+
+    except aiohttp.ClientConnectorError as e:
+        if _is_dns_error(e):
+            return {"status": "taken_down", "reason": "Domain/DNS not found", "http_code": None}
+        return {"status": "uncertain", "reason": "Connection Blocked by host (Anti-bot/SSL reset)", "http_code": None}
+    except asyncio.TimeoutError:
+        return {"status": "uncertain", "reason": "Timeout during Scribd check", "http_code": None}
+    except Exception as e:
+        return {"status": "uncertain", "reason": f"Scribd check error: {str(e)[:50]}", "http_code": None}
+
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 
@@ -1477,7 +1750,247 @@ _CHECKERS = {
     "instagram": _check_instagram,
     "x": _check_x,
     "apps": _check_app_store,
+    "scribd": _check_scribd,
 }
+
+
+_playwright_instance = None
+_playwright_browser = None
+_playwright_lock = asyncio.Lock()
+
+async def _get_playwright_browser():
+    global _playwright_instance, _playwright_browser
+    async with _playwright_lock:
+        if _playwright_browser is None:
+            from playwright.async_api import async_playwright
+            _playwright_instance = await async_playwright().start()
+            _playwright_browser = await _playwright_instance.chromium.launch(headless=True)
+    return _playwright_browser
+
+async def close_global_playwright():
+    global _playwright_instance, _playwright_browser
+    async with _playwright_lock:
+        if _playwright_browser is not None:
+            try:
+                await _playwright_browser.close()
+            except Exception:
+                pass
+            _playwright_browser = None
+        if _playwright_instance is not None:
+            try:
+                await _playwright_instance.stop()
+            except Exception:
+                pass
+            _playwright_instance = None
+
+
+def _scrapling_text(content: str, selector: str, identifier: str) -> str | None:
+    """Adaptive Scrapling text extraction backed by the shared selector-memory DB.
+    Returns None when scrapling is unavailable or the element is not found."""
+    try:
+        import os
+        from scrapling import Selector
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scrapling_selectors.db")
+        el = Selector(content, adaptive=True, storage_args={"storage_file": db_path}).css(
+            selector, identifier=identifier, adaptive=True, auto_save=True
+        )
+        return el.css('::text').get()
+    except Exception:
+        return None
+
+
+async def _check_with_playwright(session: aiohttp.ClientSession, url: str, platform: str) -> dict:
+    """
+    Playwright Fallback Checker.
+    Runs when standard HTTP checkers return "uncertain" to provide a browser-based bypass.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"status": "uncertain", "reason": "Playwright not installed", "http_code": None}
+
+    if platform == "scribd" and "?" in url:
+        url = url.split("?")[0]
+
+    # Interceptor to block visual assets
+    async def block_resources(route):
+        if route.request.resource_type in ("image", "stylesheet", "font", "media"):
+            await route.abort()
+        else:
+            await route.continue_()
+
+    try:
+        browser = await _get_playwright_browser()
+        
+        cookies = load_all_cookies()
+        platform_cookies = cookies.get(platform, [])
+        
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720},
+            locale="en-US"
+        )
+        
+        if platform_cookies:
+            formatted_cookies = []
+            for c in platform_cookies:
+                name = c.get("name")
+                value = c.get("value")
+                if name and value:
+                    formatted_cookies.append({
+                        "name": name,
+                        "value": value,
+                        "domain": ".instagram.com" if platform == "instagram" else (".facebook.com" if platform == "facebook" else ".linkedin.com"),
+                        "path": "/"
+                    })
+            if formatted_cookies:
+                try:
+                    await context.add_cookies(formatted_cookies)
+                except Exception as ce:
+                    logger.warning(f"[PLAYWRIGHT] Cookie injection failed: {ce}")
+        
+        page = await context.new_page()
+        await page.route("**/*", block_resources)
+        
+        try:
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            status = response.status if response else 200
+            title = await page.title()
+            content = await page.content()
+            html_lower = content.lower()
+            final_url = page.url
+        finally:
+            await context.close()
+        
+        if platform == "facebook":
+            title_lower = title.lower()
+            is_generic = title_lower in ("facebook", "error facebook", "") or "log in" in title_lower or "login" in title_lower
+            takedown_phrases = [
+                "content isn't available",
+                "page isn't available",
+                "this page has been removed",
+                "link you followed may be broken",
+                "page not found",
+                "profile isn't available"
+            ]
+            clean_text = _clean_html_text(content)
+            has_takedown = (
+                any(p in clean_text for p in takedown_phrases) or
+                any(p in html_lower for p in [
+                    "this content isn't available at the moment",
+                    "usually because the owner only shared it with a small group of people",
+                    "changed who can see it",
+                    "it's been deleted"
+                ])
+            )
+            
+            profile_name = _scrapling_text(content, 'h1', "facebook_profile_name")
+            
+            if is_generic and not profile_name:
+                graph_exists = await _graph_api_exists(session, url)
+                if graph_exists is True:
+                    return {"status": "active", "reason": "Facebook active (Graph API verified, login wall on browser)", "http_code": status}
+                elif graph_exists is False:
+                    return {"status": "taken_down", "reason": "Facebook profile not found (Graph API confirmed)", "http_code": status}
+                
+                # Check if final URL is a login / checkpoint redirect (meaning cookie session expired)
+                is_login_redirect = any(path in final_url.lower() for path in ("/login", "login.php", "/checkpoint", "/challenge", "/signup"))
+                
+                # If we have valid cookies injected and we still hit the login wall with a takedown phrase, and it's not a login redirect, it's a takedown.
+                # Otherwise, anonymously it's inconclusive.
+                if has_takedown and platform_cookies and not is_login_redirect:
+                    return {"status": "taken_down", "reason": "Facebook profile not found (Cookie verified)", "http_code": status}
+                
+                return {"status": "uncertain", "reason": "Facebook login wall (Playwright). Valid cookies required.", "http_code": status}
+            
+            if has_takedown:
+                return {"status": "taken_down", "reason": "Facebook profile not found (Playwright verified)", "http_code": status}
+            
+            display_name = profile_name or title
+            return {"status": "active", "reason": f"Facebook active ({display_name[:50]} - Playwright)", "http_code": status}
+            
+        elif platform == "instagram":
+            if "/accounts/login/" in final_url or "login" in title.lower():
+                return {"status": "uncertain", "reason": "Instagram login wall (Playwright)", "http_code": status}
+            takedown_phrases = ["sorry, this page isn't available", "isn't available", "removed", "broken link"]
+            if any(p in html_lower for p in takedown_phrases):
+                return {"status": "taken_down", "reason": "Instagram profile not found (Playwright)", "http_code": status}
+            
+            username = _scrapling_text(content, 'header h2', "instagram_profile_name")
+            
+            if title.strip() == "Instagram" and not username:
+                return {"status": "taken_down", "reason": "Instagram profile not found (Playwright generic title)", "http_code": status}
+            
+            display_name = username or title
+            return {"status": "active", "reason": f"Instagram is active ({display_name[:50]} - Playwright)", "http_code": status}
+            
+        elif platform == "linkedin":
+            if "/authwall" in final_url or "/login" in final_url:
+                return {"status": "uncertain", "reason": "LinkedIn authwall (Playwright)", "http_code": status}
+            if "page not found" in html_lower or status == 404:
+                return {"status": "taken_down", "reason": "LinkedIn profile not found (Playwright)", "http_code": status}
+            
+            name_text = _scrapling_text(content, 'h1', "linkedin_profile_name")
+            
+            display_name = name_text or title
+            return {"status": "active", "reason": f"LinkedIn active ({display_name[:50]} - Playwright)", "http_code": status}
+            
+        elif platform == "apps":
+            if status == 404:
+                return {"status": "taken_down", "reason": "App not found (404 - Playwright)", "http_code": 404}
+            if "we're sorry, the requested url was not found on this server" in html_lower:
+                return {"status": "taken_down", "reason": "App not found on Play Store (Playwright)", "http_code": status}
+            
+            title_text = _scrapling_text(content, 'h1', "app_store_title")
+            
+            display_title = title_text or "App"
+            return {"status": "active", "reason": f"App is available ({display_title[:50]} - Playwright)", "http_code": status}
+            
+        elif platform == "scribd":
+            title_lower = title.lower()
+            if status in (404, 406, 410):
+                return {"status": "taken_down", "reason": f"Scribd content not found ({status} - Playwright)", "http_code": status}
+            if "challenge" in title_lower or "just a moment..." in title_lower or "cloudflare" in html_lower:
+                return {"status": "uncertain", "reason": "Cloudflare / bot challenge (Playwright)", "http_code": status}
+            
+            takedown_phrases = [
+                "page not found",
+                "document removed",
+                "removal notice",
+                "this document has been removed",
+                "we're sorry, we can't find this document",
+                "scribd - document removed",
+            ]
+            if any(p in html_lower for p in takedown_phrases) or any(p in title_lower for p in ("page not found", "removal notice")):
+                return {"status": "taken_down", "reason": "Scribd content not found (Playwright)", "http_code": status}
+            
+            title_text = _scrapling_text(content, 'h1', "scribd_document_title")
+            
+            display_title = title_text or title.split("|")[0].strip()
+            return {"status": "active", "reason": f"Scribd is active ({display_title[:50]} - Playwright)", "http_code": status}
+            
+        else:
+            if status in (404, 410):
+                return {"status": "taken_down", "reason": f"Page not found ({status} - Playwright)", "http_code": status}
+            if "just a moment..." in title.lower() or "cloudflare" in html_lower:
+                return {"status": "uncertain", "reason": "Cloudflare / bot challenge (Playwright)", "http_code": status}
+            if status in (401, 403):
+                title_lower = title.lower()
+                if any(x in title_lower for x in ("forbidden", "access denied", "403", "401", "unauthorized")) or not title.strip():
+                    return {"status": "taken_down", "reason": f"Access Denied / Forbidden ({status} - Playwright)", "http_code": status}
+            if status >= 500:
+                title_lower = title.lower()
+                if any(x in title_lower for x in ("server error", "500", "502", "503", "504", "bad gateway", "service unavailable")) or not title.strip():
+                    return {"status": "taken_down", "reason": f"Server Error ({status} - Playwright)", "http_code": status}
+            
+            heading = _scrapling_text(content, 'h1', "generic_heading")
+            
+            display_name = heading or title
+            return {"status": "active", "reason": f"Page is accessible ({display_name[:50]} - Playwright)", "http_code": status}
+                
+    except Exception as e:
+        logger.warning(f"[PLAYWRIGHT] Fallback check failed for {url}: {e}")
+        return {"status": "uncertain", "reason": f"Playwright fallback error: {str(e)[:50]}", "http_code": None}
 
 
 async def _check_single(session: aiohttp.ClientSession, url: str, platform: str) -> dict:
@@ -1508,12 +2021,22 @@ async def _check_single(session: aiohttp.ClientSession, url: str, platform: str)
     }
 
     try:
-        # ── Run the existing platform checker (UNCHANGED) ──
+        # ── Run the existing platform checker ──
         checker = _CHECKERS.get(platform)
         if checker:
-            result.update(await checker(session, url))
+            res = await checker(session, url)
         else:
-            result.update(await _check_generic(session, url))
+            res = await _check_generic(session, url)
+            
+        result.update(res)
+
+        # ── Playwright Fallback if result is uncertain ──
+        if result["status"] == "uncertain" and config.ENABLE_PLAYWRIGHT_FALLBACK:
+            logger.info(f"[PLAYWRIGHT] Falling back to browser check for: {url}")
+            playwright_res = await _check_with_playwright(session, url, platform)
+            if playwright_res["status"] != "uncertain":
+                logger.info(f"[PLAYWRIGHT] Successfully verified {url} status as {playwright_res['status']}")
+                result.update(playwright_res)
 
         # ── Enterprise Enhancement: Populate Evidence ──
         if evidence and config.ENABLE_EVIDENCE:

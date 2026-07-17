@@ -2,7 +2,68 @@
   "cookies": {
     "facebook": [],
     "linkedin": [],
-    "instagram": [],
+    "instagram": [
+      {
+        "domain": ".instagram.com",
+        "name": "ps_n",
+        "value": "1"
+      },
+      {
+        "domain": ".instagram.com",
+        "name": "datr",
+        "value": "FMrxaIWFYqXobFDxNGxuRdrG"
+      },
+      {
+        "domain": ".instagram.com",
+        "name": "ig_nrcb",
+        "value": "1"
+      },
+      {
+        "domain": ".instagram.com",
+        "name": "ds_user_id",
+        "value": "74235587931"
+      },
+      {
+        "domain": ".instagram.com",
+        "name": "csrftoken",
+        "value": "JX7FMfedjlQRTUer4Wjld6pDsCBlgTCN"
+      },
+      {
+        "domain": ".instagram.com",
+        "name": "ig_did",
+        "value": "62A331A1-9207-4085-B3C5-E99434A3C6D8"
+      },
+      {
+        "domain": ".instagram.com",
+        "name": "ps_l",
+        "value": "1"
+      },
+      {
+        "domain": ".instagram.com",
+        "name": "wd",
+        "value": "1280x551"
+      },
+      {
+        "domain": ".instagram.com",
+        "name": "mid",
+        "value": "aQnJvQALAAG88HewxhDLXDt6yGPf"
+      },
+      {
+        "domain": ".instagram.com",
+        "name": "sessionid",
+        "value": "74235587931%3AqVhBhK0p9jRHx3%3A11%3AAYiDLlTl8_weIEoe0mSZSMtlm1mpq13CswHB_rlwcJY"
+      },
+      {
+        "domain": ".instagram.com",
+        "name": "dpr",
+        "value": "1.5"
+      },
+      {
+        "domain": ".instagram.com",
+        "name": "rur",
+        "value": "SCU%2C17841474277939448%2C1785475959%3A01ff6fc735a2cfd494c4e49d01d2ff3efb7a3e85e1b6eac91b7b979e85816d8e8364ebd9"
+      }
+    ],
     "x": []
   }
 }

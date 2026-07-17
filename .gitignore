@@ -15,6 +15,9 @@ ENV/
 # Logs and databases
 *.log
 *.sqlite
+*.db
+*.db-shm
+*.db-wal
 
 # IDE configuration files
 .idea/

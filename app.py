@@ -191,6 +191,17 @@ async def export_results(request: ExportRequest):
     )
 
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Ensure the global Playwright browser closes cleanly on app shutdown."""
+    try:
+        from backend.fast_checker import close_global_playwright
+        await close_global_playwright()
+        logger.info("[PLAYWRIGHT] Global browser closed cleanly on shutdown.")
+    except Exception as e:
+        logger.warning(f"[PLAYWRIGHT] Error closing global browser on shutdown: {e}")
+
+
 # Mount frontend static files at root
 app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 

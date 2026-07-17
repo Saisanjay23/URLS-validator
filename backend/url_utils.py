@@ -32,6 +32,9 @@ _PLATFORM_MAP: dict[str, str] = {
     # LinkedIn
     "linkedin.com": "linkedin",
     "www.linkedin.com": "linkedin",
+    # Scribd
+    "scribd.com": "scribd",
+    "www.scribd.com": "scribd",
     # Google
     "maps.app.goo.gl": "google_maps",
     "goo.gl": "google",

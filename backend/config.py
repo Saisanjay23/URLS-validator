@@ -42,6 +42,7 @@ ENABLE_STRUCTURED_LOGGING  = _env_bool("ENABLE_STRUCTURED_LOGGING")
 ENABLE_PARKING_EXPANSION   = _env_bool("ENABLE_PARKING_EXPANSION")
 ENABLE_ERROR_CLASSIFICATION = _env_bool("ENABLE_ERROR_CLASSIFICATION")
 ENABLE_PLATFORM_METADATA   = _env_bool("ENABLE_PLATFORM_METADATA")
+ENABLE_PLAYWRIGHT_FALLBACK  = _env_bool("ENABLE_PLAYWRIGHT_FALLBACK", default=True)
 
 
 # ── Per-Host Concurrency Limits ───────────────────────────────────────────────
@@ -123,4 +124,5 @@ def get_all_flags() -> dict[str, Any]:
         "parking_expansion": ENABLE_PARKING_EXPANSION,
         "error_classification": ENABLE_ERROR_CLASSIFICATION,
         "platform_metadata": ENABLE_PLATFORM_METADATA,
+        "playwright_fallback": ENABLE_PLAYWRIGHT_FALLBACK,
     }
