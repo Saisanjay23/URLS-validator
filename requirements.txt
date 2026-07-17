@@ -6,3 +6,4 @@ httpx[http2]>=0.27.0
 aiofiles>=23.0.0
 curl_cffi>=0.7.3
 scrapling[fetchers]>=0.1.8
+playwright>=1.40.0
