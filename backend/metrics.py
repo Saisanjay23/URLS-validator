@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -24,14 +24,8 @@ class CheckMetric:
     status: str = ""
     dns_ms: float = 0.0
     connect_ms: float = 0.0
-    tls_ms: float = 0.0
     ttfb_ms: float = 0.0
-    download_ms: float = 0.0
-    parsing_ms: float = 0.0
-    decision_ms: float = 0.0
     total_ms: float = 0.0
-    timestamp: float = field(default_factory=time.time)
-    retries: int = 0
     error_type: str | None = None
 
 
@@ -123,19 +117,6 @@ class MetricsCollector:
             summary["error_breakdown"] = dict(self._error_counts)
 
         return summary
-
-    def reset(self) -> None:
-        """Reset all metrics."""
-        self._metrics.clear()
-        self._total_checks = 0
-        self._status_counts.clear()
-        self._platform_counts.clear()
-        self._error_counts.clear()
-        self._total_dns_ms = 0.0
-        self._total_connect_ms = 0.0
-        self._total_ttfb_ms = 0.0
-        self._total_check_ms = 0.0
-        self._start_time = time.time()
 
 
 # ── Global Instance ───────────────────────────────────────────────────────────

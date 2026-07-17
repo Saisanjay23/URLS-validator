@@ -10,7 +10,6 @@ This is metadata-only — it never changes existing status decisions.
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,42 +18,26 @@ from typing import Any
 class Evidence:
     """
     Container for all signals collected during a URL check.
-    
+
     Every field is optional — checkers populate what they can.
     The confidence engine and decision engine read from this.
     """
 
-    # ── DNS ────────────────────────────────────────────────────────────────
+    # ── DNS / HTTP ─────────────────────────────────────────────────────────
     dns_resolved: bool | None = None
-    dns_latency_ms: float = 0.0
-    dns_error_type: str | None = None        # NXDOMAIN, SERVFAIL, TIMEOUT, etc.
-    dns_records: dict[str, Any] = field(default_factory=dict)  # A, AAAA, CNAME
-
-    # ── HTTP ───────────────────────────────────────────────────────────────
     http_status: int | None = None
-    http_headers: dict[str, str] = field(default_factory=dict)
-    http_method: str = "GET"                 # GET or HEAD
-    http_latency_ms: float = 0.0
 
     # ── Redirects ──────────────────────────────────────────────────────────
-    redirect_chain: list[str] = field(default_factory=list)
     redirect_count: int = 0
     redirect_classifications: list[str] = field(default_factory=list)  # per-hop classification
     cross_domain: bool = False
-    original_host: str = ""
-    final_host: str = ""
-    final_url: str = ""
 
     # ── Content — extracted from HTML ──────────────────────────────────────
     title: str = ""
-    h1: str = ""
     og_title: str = ""
     og_description: str = ""
-    og_url: str = ""
-    og_image: str = ""
     canonical: str = ""
     content_length: int = 0
-    meta_robots: str = ""
 
     # ── Structured Metadata ────────────────────────────────────────────────
     json_ld: list[dict] = field(default_factory=list)
@@ -70,16 +53,11 @@ class Evidence:
     # ── Platform-Specific Signals ──────────────────────────────────────────
     platform_signals: dict[str, Any] = field(default_factory=dict)
     # Examples:
-    #   Facebook:  {"page_id": "123", "page_type": "profile", "graph_api_exists": True}
+    #   Facebook:  {"page_id": "123", "graph_api_exists": True}
     #   Instagram: {"username": "zuck", "followers": "1M"}
-    #   YouTube:   {"channel_id": "UC...", "video_id": "dQw4..."}
-    #   X:         {"author": "elonmusk", "tweet_id": "123"}
-    #   Telegram:  {"channel": "durov", "type": "channel"}
-    #   LinkedIn:  {"profile_type": "person", "name": "John Doe"}
 
     # ── Parking / Seized ──────────────────────────────────────────────────
     parking_detected: bool = False
-    parking_reason: str | None = None
     parking_provider: str | None = None      # GoDaddy, Sedo, Namecheap, etc.
 
     # ── Error Classification ──────────────────────────────────────────────
@@ -91,13 +69,8 @@ class Evidence:
     # ── Timing ────────────────────────────────────────────────────────────
     dns_time_ms: float = 0.0
     connect_time_ms: float = 0.0
-    tls_time_ms: float = 0.0
     ttfb_ms: float = 0.0
-    download_time_ms: float = 0.0
-    parsing_time_ms: float = 0.0
-    decision_time_ms: float = 0.0
     total_latency_ms: float = 0.0
-    check_start_time: float = field(default_factory=time.monotonic)
 
     # ── Signals (for confidence scoring) ───────────────────────────────────
     _positive_signals: list[str] = field(default_factory=list)
@@ -111,15 +84,6 @@ class Evidence:
         else:
             if name not in self._negative_signals:
                 self._negative_signals.append(name)
-
-    @property
-    def all_signals(self) -> list[str]:
-        """Return all signals (positive and negative) for the response."""
-        return self._positive_signals + [f"-{s}" for s in self._negative_signals]
-
-    def elapsed_ms(self) -> float:
-        """Milliseconds since this evidence object was created."""
-        return (time.monotonic() - self.check_start_time) * 1000
 
     def to_metadata_dict(self) -> dict[str, Any]:
         """

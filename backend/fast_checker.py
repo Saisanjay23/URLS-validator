@@ -69,7 +69,7 @@ from backend.cookies import get_cookie_header_string, load_all_cookies
 from backend import config
 from backend.evidence import Evidence
 from backend.confidence import compute_confidence
-from backend.parking import detect_expanded_parking
+from backend.parking import detect_expanded_parking, PARKING_DOMAINS
 from backend.intelligence import classify_error
 from backend.networking import circuit_breaker, rate_limiter
 from backend.metrics import metrics_collector, CheckMetric
@@ -246,22 +246,12 @@ def _og_description(html: str) -> str:
     return _og_meta(html, "description")
 
 
-def _og_url(html: str) -> str:
-    return _og_meta(html, "url")
-
-
 def _canonical(html: str) -> str:
     """Extract <link rel='canonical'> href."""
     m = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']*)["\']', html, re.IGNORECASE)
     if not m:
         m = re.search(r'<link[^>]+href=["\']([^"\']*)["\'][^>]+rel=["\']canonical["\']', html, re.IGNORECASE)
     return m.group(1).strip() if m else ""
-
-
-def _meta_robots(html: str) -> str:
-    """Extract <meta name='robots'> content."""
-    m = re.search(r'<meta\s+name=["\']robots["\']\s+content=["\']([^"\']*)["\']', html, re.IGNORECASE)
-    return m.group(1).strip().lower() if m else ""
 
 
 def _is_dns_error(error: aiohttp.ClientConnectorError) -> bool:
@@ -802,20 +792,31 @@ async def _check_facebook(session: aiohttp.ClientSession, url: str) -> dict:
 
     try:
         for name, engine in engines:
-            try:
-                status, html, final_url = await engine()
-            except aiohttp.ClientConnectorError as e:
-                if _is_dns_error(e):
-                    return {"status": "taken_down", "reason": "Domain/DNS not found", "http_code": None}
-                continue
-            except Exception as e:
-                logger.warning(f"[FACEBOOK] engine {name} failed for {url}: {str(e)[:80]}")
-                continue
+            # Walls/challenges and transient errors are often per-request
+            # heuristics on Facebook's side (especially during batch runs from
+            # one IP), so give each engine a second attempt after a short
+            # jittered delay before discounting it.
+            verdict = None
+            for attempt in range(2):
+                if attempt:
+                    await asyncio.sleep(random.uniform(1.0, 2.5))
+                try:
+                    status, html, final_url = await engine()
+                except aiohttp.ClientConnectorError as e:
+                    if _is_dns_error(e):
+                        return {"status": "taken_down", "reason": "Domain/DNS not found", "http_code": None}
+                    continue
+                except Exception as e:
+                    logger.warning(f"[FACEBOOK] engine {name} failed for {url} (attempt {attempt + 1}): {str(e)[:80]}")
+                    continue
 
-            last_status = status
-            verdict = _fb_classify(status, html, final_url, url)
+                last_status = status
+                verdict = _fb_classify(status, html, final_url, url)
+                if verdict is not None:
+                    break
+                logger.info(f"[FACEBOOK] engine {name} inconclusive (wall/challenge) for {url} (attempt {attempt + 1})")
+
             if verdict is None:
-                logger.info(f"[FACEBOOK] engine {name} inconclusive (wall/challenge) for {url}")
                 continue
 
             kind, detail = verdict
@@ -1520,8 +1521,7 @@ async def _check_generic(session: aiohttp.ClientSession, url: str) -> dict:
         if cross_domain:
             final_host = urlparse(final_url).hostname or ""
             # Check if redirected to a known parking/error domain
-            parking_domains = ["sedoparking.com", "bodis.com", "hugedomains.com", "afternic.com", "dan.com"]
-            if any(pd in final_host for pd in parking_domains):
+            if any(pd in final_host for pd in PARKING_DOMAINS):
                 return {"status": "taken_down", "reason": f"Redirects to parking page ({final_host})", "http_code": status}
 
         # Step 3: HTTP status analysis

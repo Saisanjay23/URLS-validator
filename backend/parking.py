@@ -194,19 +194,3 @@ def detect_expanded_parking(html: str, title: str, h1: str) -> str | None:
 
     return None
 
-
-def is_parking_domain(hostname: str) -> str | None:
-    """
-    Check if a hostname is a known parking/domain-sale domain.
-    
-    Args:
-        hostname: Hostname of the final URL after redirects.
-    
-    Returns:
-        Parking domain name if match found, None otherwise.
-    """
-    hostname_lower = hostname.lower()
-    for domain in PARKING_DOMAINS:
-        if domain in hostname_lower:
-            return domain
-    return None

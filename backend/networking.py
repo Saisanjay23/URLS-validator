@@ -4,8 +4,6 @@ Networking Infrastructure — Enterprise URL Validation Engine.
 Contains:
   1. Circuit Breaker — Per-host failure tracking with auto-recovery
   2. Adaptive Rate Limiter — Per-host concurrency semaphores
-  3. Enhanced Retry Engine — Retries only transient failures
-  4. Enhanced DNS Resolver — Better error classification
 
 All components are independently feature-flagged.
 """
@@ -13,23 +11,13 @@ All components are independently feature-flagged.
 from __future__ import annotations
 
 import asyncio
-import random
-import socket
 import time
-from typing import Any
-
-import aiohttp
 
 from backend.config import (
     CIRCUIT_BREAKER_COOLDOWN,
     CIRCUIT_BREAKER_THRESHOLD,
     ENABLE_CIRCUIT_BREAKER,
     HOST_CONCURRENCY,
-    RETRY_BASE_DELAY,
-    RETRY_MAX_ATTEMPTS,
-    RETRY_MAX_DELAY,
-    RETRY_STATUS_CODES,
-    NO_RETRY_STATUS_CODES,
 )
 from backend.logger import get_logger
 
@@ -176,156 +164,9 @@ class AdaptiveRateLimiter:
                 self._semaphores[normalized] = asyncio.Semaphore(limit)
             return self._semaphores[normalized]
 
-    def get_config(self) -> dict[str, int]:
-        """Return per-host concurrency configuration."""
-        return dict(self._limits)
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. ENHANCED RETRY ENGINE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def should_retry(status_code: int | None = None,
-                 error: Exception | None = None) -> bool:
-    """
-    Determine if a request should be retried.
-
-    Retries ONLY transient failures:
-      - HTTP 429, 500, 502, 503, 504
-      - Timeout errors
-      - Connection reset
-      - SSL handshake failures
-
-    NEVER retries:
-      - HTTP 404, 410, 451 (permanent)
-      - DNS failures (NXDOMAIN)
-      - Content-based decisions
-    """
-    if status_code is not None:
-        if status_code in NO_RETRY_STATUS_CODES:
-            return False
-        if status_code in RETRY_STATUS_CODES:
-            return True
-
-    if error is not None:
-        error_type = type(error).__name__
-        error_msg = str(error).lower()
-
-        # Timeout — always retry
-        if "timeout" in error_type.lower() or "timeout" in error_msg:
-            return True
-
-        # Connection reset — retry
-        if "reset" in error_msg or "broken pipe" in error_msg:
-            return True
-
-        # SSL handshake — retry once
-        if "ssl" in error_msg and "handshake" in error_msg:
-            return True
-
-        # DNS NXDOMAIN — never retry (permanent)
-        if "getaddrinfo" in error_msg or "nodename" in error_msg:
-            return False
-
-        # Generic connection error — retry
-        if isinstance(error, aiohttp.ClientConnectorError):
-            # But not DNS errors
-            if "getaddrinfo" not in error_msg:
-                return True
-
-    return False
-
-
-def compute_backoff_delay(attempt: int) -> float:
-    """
-    Compute exponential backoff delay with jitter.
-
-    Formula: min(max_delay, base_delay * 2^attempt + random_jitter)
-    """
-    delay = min(
-        RETRY_MAX_DELAY,
-        RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5),
-    )
-    return delay
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4. ENHANCED DNS RESOLVER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def resolve_dns(hostname: str) -> dict[str, Any]:
-    """
-    Enhanced async DNS resolution using socket.getaddrinfo.
-
-    Returns a dict with:
-      resolved: bool
-      latency_ms: float
-      error_type: str | None  (NXDOMAIN, SERVFAIL, TIMEOUT, MISCONFIGURED)
-      addresses: list[str]    (resolved IP addresses)
-      has_ipv6: bool
-
-    Uses the existing socket.getaddrinfo approach with better error
-    classification (no aiodns dependency).
-    """
-    result: dict[str, Any] = {
-        "resolved": False,
-        "latency_ms": 0.0,
-        "error_type": None,
-        "addresses": [],
-        "has_ipv6": False,
-    }
-
-    loop = asyncio.get_event_loop()
-    start = time.monotonic()
-
-    try:
-        # Resolve IPv4 (A records)
-        addrs = await asyncio.wait_for(
-            loop.run_in_executor(None, socket.getaddrinfo, hostname, 443),
-            timeout=5.0,
-        )
-
-        elapsed = (time.monotonic() - start) * 1000
-        result["latency_ms"] = round(elapsed, 1)
-        result["resolved"] = True
-
-        # Collect unique addresses
-        seen_addrs: set[str] = set()
-        for family, _, _, _, sockaddr in addrs:
-            addr = sockaddr[0]
-            if addr not in seen_addrs:
-                seen_addrs.add(addr)
-                result["addresses"].append(addr)
-                if family == socket.AF_INET6:
-                    result["has_ipv6"] = True
-
-    except asyncio.TimeoutError:
-        result["latency_ms"] = round((time.monotonic() - start) * 1000, 1)
-        result["error_type"] = "TIMEOUT"
-
-    except socket.gaierror as e:
-        result["latency_ms"] = round((time.monotonic() - start) * 1000, 1)
-        error_code = getattr(e, "errno", None)
-        error_msg = str(e).lower()
-
-        if "name or service not known" in error_msg or "nodename nor servname" in error_msg:
-            result["error_type"] = "NXDOMAIN"
-        elif "temporary failure" in error_msg:
-            result["error_type"] = "SERVFAIL"
-        elif "no address" in error_msg:
-            result["error_type"] = "NO_ADDRESS"
-        else:
-            result["error_type"] = "DNS_ERROR"
-
-    except Exception as e:
-        result["latency_ms"] = round((time.monotonic() - start) * 1000, 1)
-        result["error_type"] = "DNS_ERROR"
-
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5. GLOBAL INSTANCES
+# 3. GLOBAL INSTANCES
 # ═══════════════════════════════════════════════════════════════════════════════
 # Singleton instances shared across the application lifecycle.
 
