@@ -73,6 +73,17 @@
                     <i class="fas fa-eraser"></i>
                     <span>Clear</span>
                 </button>
+                <label class="screenshot-mode" id="screenshotModeWrap"
+                    title="Capture page screenshots (hover a URL to preview). Slower — renders a browser page per matching URL.">
+                    <i class="fas fa-camera"></i>
+                    <select id="screenshotMode">
+                        <option value="off" selected>Screenshots: Off</option>
+                        <option value="all">Screenshots: All URLs</option>
+                        <option value="active">Screenshots: Active only</option>
+                        <option value="uncertain">Screenshots: Uncertain only</option>
+                        <option value="taken_down">Screenshots: Taken down only</option>
+                    </select>
+                </label>
             </div>
         </section>
 
@@ -158,8 +169,13 @@
                         </svg>
                         Export CSV
                     </button>
+                    <button class="btn btn--small btn--primary" id="exportExcelBtn" type="button">
+                        <i class="fas fa-file-excel" style="margin-right: 4px; color: #10B981;"></i>
+                        Export Excel Report
+                    </button>
                 </div>
             </div>
+
 
             <!-- ── Filter pills ── -->
             <div class="filters" id="filters">

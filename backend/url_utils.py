@@ -73,14 +73,53 @@ def normalize_url(raw: str) -> str | None:
     elif url.startswith("http://https://"):
         url = url.replace("http://https://", "https://")
 
+    # Unwrap URLs pasted out of prose or a document: '"https://x.com"',
+    # '<https://x.com>', '(see https://x.com)', 'Profile: https://x.com'.
+    # Left unhandled, the leading character defeats the scheme check below, the
+    # string gets an extra "https://" prefix, and the resulting garbage host
+    # fails DNS — reported as a confidently dead domain.
+    scheme_at = re.search(r"https?://", url, re.IGNORECASE)
+    if scheme_at and scheme_at.start() > 0:
+        url = url[scheme_at.start():]
+    else:
+        url = url.lstrip("<([{\"'` \t")
+
     # Fix spaces in scheme — e.g. "https ://" → "https://"
     url = re.sub(r"^(https?)\s*:\s*//", r"\1://", url, flags=re.IGNORECASE)
+
+    # Strip any trailing copy-pasted contact/phone numbers (e.g. "+91 9638992878" or "+919876543210" tacked onto URLs)
+    url = re.sub(r"\+\d{1,4}(\s*[\s-]\s*\d+)+$", "", url).strip()
+    # Handle concatenated phone numbers or country codes without space (e.g., id=61581807675905+91)
+    url = re.sub(r"(?<=[a-zA-Z0-9/&=_])\+\d{8,15}$", "", url).strip()
+    url = re.sub(r"(?<=\d)\+\d{1,4}$", "", url).strip()
+
+    # If there is any remaining whitespace (e.g., URL followed by text or comments), take only the URL part
+    if " " in url or "\t" in url:
+        url = url.split()[0]
 
     # If there's no scheme, prepend https://
     if not re.match(r"^https?://", url, re.IGNORECASE):
         if "." not in url:
             return None
         url = f"https://{url}"
+    
+    # Strip trailing quotes/punctuation picked up by copy-paste.
+    #
+    # A closing bracket is only noise when it is UNBALANCED. Stripping it
+    # unconditionally truncates legitimate URLs that end in one — Wikipedia
+    # titles ("..._(programming_language)", "..._(film)") are the common case —
+    # and the shortened URL then returns a real 404, so a live page is reported
+    # taken down with full confidence. Balance-check before removing.
+    while url:
+        tail = url[-1]
+        if tail in ",;>'\"":
+            url = url[:-1]
+        elif tail == ")" and url.count(")") > url.count("("):
+            url = url[:-1]
+        elif tail == "]" and url.count("]") > url.count("["):
+            url = url[:-1]
+        else:
+            break
 
     # Final validation — must parse to something with a hostname
     try:
@@ -108,7 +147,15 @@ def detect_platform(url: str) -> str:
         bare = hostname.removeprefix("www.")
         if bare in _PLATFORM_MAP:
             return _PLATFORM_MAP[bare]
-            
+
+        # Regional / functional subdomains of a known platform still belong to
+        # that platform: id.scribd.com is Scribd, not a generic website. Without
+        # this they fell through to the generic checker, which reads Cloudflare's
+        # "Client Challenge" interstitial as a normal page and reports it active.
+        for known, platform in _PLATFORM_MAP.items():
+            if bare.endswith("." + known):
+                return platform
+
         # Smart detection for third-party app stores and game sites
         url_lower = url.lower()
         if "/app/" in url_lower or "/apps/" in url_lower or "apk" in bare or "/game/" in url_lower:

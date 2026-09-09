@@ -33,8 +33,13 @@ EXPANDED_PARKING_SIGNALS: list[str] = [
     "the owner of this domain has not yet uploaded their website",
     "future home of something quite cool",
 
+    # ── DirectFwd (JS parking redirect / traffic monetization) ──
+    "directfwd.com",
+    "sk-jspark_init",
+
     # ── Porkbun ──
-    "porkbun.com",
+    "this domain is parked by porkbun",
+    "purchased at porkbun.com",
 
     # ── Google Domains ──
     "this site is hosted by google",
@@ -43,10 +48,12 @@ EXPANDED_PARKING_SIGNALS: list[str] = [
     "parkingcrew",
 
     # ── Bodis ──
-    "bodis.com",
+    "bodis.com/parking",
+    "parked by bodis",
 
     # ── Above.com ──
-    "above.com",
+    "parked by above.com",
+    "domain parking by above",
 
     # ── Cloudflare Placeholder ──
     "attention required! | cloudflare",
@@ -116,7 +123,6 @@ EXPANDED_PARKING_SIGNALS: list[str] = [
     "this site is no longer available",
 
     # ── Shopify ──
-    "only one step left!",
     "this store is unavailable",
     "sorry, this shop is currently unavailable",
 
@@ -133,7 +139,6 @@ EXPANDED_PARKING_SIGNALS: list[str] = [
 
     # ── Firebase Hosting ──
     "firebase hosting setup complete",
-    "site not found",
 
     # ── Render ──
     "not found | render",

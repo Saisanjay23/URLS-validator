@@ -514,3 +514,60 @@ body {
   color: var(--success);
   font-size: 0.875rem;
 }
+
+/* ── Screenshot hover preview ─────────────────────────────────────────── */
+#screenshotPreview {
+  position: fixed;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0;
+  transform: scale(0.98);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  border-radius: var(--border-radius, 10px);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  max-width: 380px;
+}
+#screenshotPreview.visible {
+  opacity: 1;
+  transform: scale(1);
+}
+#screenshotPreview img {
+  display: block;
+  width: 380px;
+  height: auto;
+  max-height: 320px;
+  object-fit: cover;
+  object-position: top center;
+}
+.url-cell.has-screenshot::after {
+  content: "📷";
+  font-size: 0.72em;
+  margin-left: 6px;
+  opacity: 0.55;
+  vertical-align: middle;
+}
+
+/* ── Screenshot mode selector ─────────────────────────────────────────── */
+.screenshot-mode {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+.screenshot-mode select {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--border-radius, 8px);
+  padding: 0.45rem 0.6rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.screenshot-mode select:hover {
+  border-color: var(--primary);
+}

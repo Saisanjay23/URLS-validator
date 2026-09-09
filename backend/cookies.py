@@ -7,7 +7,6 @@ Provides cookie headers for HTTP requests.
 
 import json
 import os
-from typing import Any
 
 COOKIE_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

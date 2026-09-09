@@ -1,0 +1,79 @@
+{
+  "_README": [
+    "Labeled ground-truth URLs for accuracy regression testing.",
+    "Run:  python tests/regression_check.py",
+    "'active'      = the profile/content is live and should be reported active.",
+    "'taken_down'  = the profile/content is gone and should be reported taken_down.",
+    "Seed set: Facebook entries were verified live 2026-07-18. Major brand accounts",
+    "are treated as active; random gibberish handles are reliably nonexistent.",
+    "MAINTENANCE: re-verify periodically and expand each list. A dropping pass-rate",
+    "for one platform is the early-warning signal that its signals have drifted."
+  ],
+  "facebook": {
+    "active": [
+      "https://www.facebook.com/facebook",
+      "https://www.facebook.com/nasa",
+      "https://www.facebook.com/zuck",
+      "https://www.facebook.com/profile.php?id=4",
+      "https://www.facebook.com/groups/430017090388013/"
+    ],
+    "taken_down": [
+      "https://www.facebook.com/profile.php?id=61590671002928",
+      "https://www.facebook.com/profile.php?id=61575538719448",
+      "https://www.facebook.com/profile.php?id=61566060915952",
+      "https://www.facebook.com/thispagedoesnotexist8492619",
+      "https://www.facebook.com/xkqjwzy19472ax",
+      "https://www.facebook.com/profile.php?id=1"
+    ]
+  },
+  "youtube": {
+    "active": [
+      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "https://www.youtube.com/@NASA"
+    ],
+    "taken_down": [
+      "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+      "https://www.youtube.com/watch?v=00000000000"
+    ]
+  },
+  "instagram": {
+    "active": [
+      "https://www.instagram.com/nasa/"
+    ],
+    "taken_down": [
+      "https://www.instagram.com/thisusernamedoesnotexist_xk19zz/"
+    ]
+  },
+  "x": {
+    "active": [
+      "https://x.com/nasa"
+    ],
+    "taken_down": [
+      "https://x.com/thisusernamedoesnotexist_xk19zz"
+    ]
+  },
+  "telegram": {
+    "active": [
+      "https://t.me/telegram"
+    ],
+    "taken_down": [
+      "https://t.me/thischanneldoesnotexist_xk19zz"
+    ]
+  },
+  "linkedin": {
+    "active": [
+      "https://www.linkedin.com/company/linkedin/"
+    ],
+    "taken_down": [
+      "https://www.linkedin.com/company/thiscompanydoesnotexist-xk19zz/"
+    ]
+  },
+  "generic": {
+    "active": [
+      "https://www.example.com/"
+    ],
+    "taken_down": [
+      "https://thisdomaindoesnotexist-xk19zz.com/"
+    ]
+  }
+}

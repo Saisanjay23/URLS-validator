@@ -149,7 +149,14 @@ class AdaptiveRateLimiter:
 
     def release(self, host: str) -> None:
         """Release a concurrency slot for the given host."""
-        sem = self._semaphores.get(host) or self._semaphores.get("_default")
+        # Must normalise exactly as _get_semaphore does. Looking up the raw host
+        # missed the semaphore that acquire() created ("www.facebook.com" vs
+        # "facebook.com"), so the permit was never returned and the host's slots
+        # leaked to zero — after 5 Facebook URLs every later one blocked forever.
+        # That deadlock is why this limiter was left disabled, which in turn let
+        # 50 concurrent requests hit one platform and destabilise its verdicts.
+        normalized = host.lower().removeprefix("www.").removeprefix("m.")
+        sem = self._semaphores.get(normalized)
         if sem:
             sem.release()
 

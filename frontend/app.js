@@ -13,6 +13,7 @@
     const stopBtn       = document.getElementById("stopBtn");
     const refreshBtn    = document.getElementById("refreshBtn");
     const clearBtn      = document.getElementById("clearBtn");
+    const screenshotMode = document.getElementById("screenshotMode");
     const progressWrap  = document.getElementById("progressWrapper");
     const progressFill  = document.getElementById("progressFill");
     const progressText  = document.getElementById("progressText");
@@ -20,7 +21,9 @@
     const resultsSection = document.getElementById("resultsSection");
     const resultsBody   = document.getElementById("resultsBody");
     const exportBtn     = document.getElementById("exportBtn");
+    const exportExcelBtn = document.getElementById("exportExcelBtn");
     const exportZipBtn  = document.getElementById("exportZipBtn");
+
     const copyBtn       = document.getElementById("copyBtn");
     const copyIcon      = document.getElementById("copyIcon");
     const copySuccessIcon = document.getElementById("copySuccessIcon");
@@ -243,7 +246,7 @@
         const response = await fetch("/api/check", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ urls }),
+            body: JSON.stringify({ urls, screenshot_mode: screenshotMode ? screenshotMode.value : "off" }),
             signal: signal,
         });
 
@@ -371,9 +374,13 @@
         else if (platName === "app_store") platName = "Apps";
         else platName = platName.split('_').map(cap).join(' ');
 
+        const shotAttr = data.screenshot_url
+            ? ` data-screenshot="${esc(data.screenshot_url)}"`
+            : "";
+        const shotClass = data.screenshot_url ? " has-screenshot" : "";
         tr.innerHTML = `
             <td class="col-num" style="text-align:center;color:var(--text-muted)">${rowIndex}</td>
-            <td class="col-url"><a href="${esc(data.url)}" target="_blank" rel="noopener noreferrer" class="url-cell" title="${esc(data.url)}">${truncUrl(data.url, 65)}</a></td>
+            <td class="col-url"><a href="${esc(data.url)}" target="_blank" rel="noopener noreferrer" class="url-cell${shotClass}" title="${esc(data.url)}"${shotAttr}>${truncUrl(data.url, 65)}</a></td>
             <td class="col-platform"><span class="platform-badge">${icon} ${cap(platName)}</span></td>
             <td class="col-status"><span class="status-pill status-pill--${data.status}"><span class="status-dot"></span>${STATUS_LABELS[data.status] || data.status}</span></td>
             <td class="col-reason"><span class="reason-text">${esc(data.reason || "—")}</span></td>
@@ -381,6 +388,56 @@
         `;
         resultsBody.appendChild(tr);
     }
+
+    // ── Screenshot hover preview ─────────────────────────────────────────
+    const shotPreview = document.createElement("div");
+    shotPreview.id = "screenshotPreview";
+    shotPreview.innerHTML = '<img alt="page screenshot preview">';
+    document.body.appendChild(shotPreview);
+    const shotImg = shotPreview.querySelector("img");
+    let shotVisible = false;
+
+    function positionShot(e) {
+        const pad = 16;
+        const w = shotPreview.offsetWidth || 380;
+        const h = shotPreview.offsetHeight || 260;
+        let x = e.clientX + pad;
+        let y = e.clientY + pad;
+        if (x + w > window.innerWidth) x = e.clientX - w - pad;
+        if (y + h > window.innerHeight) y = window.innerHeight - h - pad;
+        if (y < pad) y = pad;
+        shotPreview.style.left = `${Math.max(pad, x)}px`;
+        shotPreview.style.top = `${y}px`;
+    }
+
+    function hideShot() {
+        shotPreview.classList.remove("visible");
+        shotVisible = false;
+    }
+
+    // If the image can't load (e.g. capture disabled/failed), don't show a broken box.
+    shotImg.addEventListener("error", hideShot);
+
+    // Delegated so it works for rows added as results stream in.
+    resultsBody.addEventListener("mouseover", (e) => {
+        const cell = e.target.closest(".url-cell.has-screenshot");
+        if (!cell) return;
+        const src = cell.getAttribute("data-screenshot");
+        if (!src) return;
+        if (shotImg.getAttribute("src") !== src) shotImg.setAttribute("src", src);
+        shotPreview.classList.add("visible");
+        shotVisible = true;
+        positionShot(e);
+    });
+    resultsBody.addEventListener("mousemove", (e) => {
+        if (shotVisible) positionShot(e);
+    });
+    resultsBody.addEventListener("mouseout", (e) => {
+        const cell = e.target.closest(".url-cell.has-screenshot");
+        if (!cell) return;
+        if (e.relatedTarget && cell.contains(e.relatedTarget)) return;
+        hideShot();
+    });
 
     function getHttpClass(code) {
         if (code == null) return "http-code--na";
@@ -464,11 +521,20 @@
         openExportModal("csv");
     });
 
+    if (exportExcelBtn) {
+        exportExcelBtn.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            openExportModal("excel");
+        });
+    }
+
     exportZipBtn.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
         openExportModal("zip");
     });
+
 
     closeExportModalBtn.addEventListener("click", (e) => {
         e.preventDefault();
@@ -516,7 +582,32 @@
             a.download = `url-status-report-${ts}.csv`;
             a.click();
             URL.revokeObjectURL(url);
+        } else if (currentExportType === "excel") {
+            if (exportExcelBtn) exportExcelBtn.disabled = true;
+            try {
+                const response = await fetch("/api/export/excel", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ results: filtered }),
+                });
+                if (!response.ok) throw new Error("Excel export failed");
+
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                const ts = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
+                a.href = url;
+                a.download = `url-summary-report-${ts}.xlsx`;
+                a.click();
+                URL.revokeObjectURL(url);
+            } catch (e) {
+                console.error("Excel export error:", e);
+                alert("Failed to export Excel report");
+            } finally {
+                if (exportExcelBtn) exportExcelBtn.disabled = false;
+            }
         } else if (currentExportType === "zip") {
+
             exportZipBtn.disabled = true;
             const orig = exportZipBtn.innerHTML;
             exportZipBtn.innerHTML = "Exporting...";

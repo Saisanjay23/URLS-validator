@@ -14,10 +14,15 @@ ENV/
 
 # Logs and databases
 *.log
+# RotatingFileHandler backups (validation.log.1, .2, .3) — *.log alone misses these
+*.log.*
 *.sqlite
 *.db
 *.db-shm
 *.db-wal
+
+# Screenshot evidence captures
+evidence/
 
 # IDE configuration files
 .idea/
