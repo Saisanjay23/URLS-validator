@@ -53,6 +53,53 @@ _PLATFORM_MAP: dict[str, str] = {
 }
 
 
+def is_email(raw: str) -> bool:
+    """Return True if the raw string represents an email address, not an HTTP web URL."""
+    if not raw:
+        return False
+    s = raw.strip()
+    if s.lower().startswith("mailto:"):
+        s = s[7:].strip()
+    return bool(re.match(r"^[^/\s@]+@[^/\s@]+\.[^/\s@]+$", s))
+
+
+def normalize_email(raw: str) -> str | None:
+    """Clean and normalize a raw email address string.
+
+    Strips mailto: prefix, cleans leading/trailing punctuation and whitespace,
+    and returns lowercase email or None if invalid.
+    """
+    if not raw:
+        return None
+    s = raw.strip()
+    if s.lower().startswith("mailto:"):
+        s = s[7:].strip()
+    s = s.rstrip(".,;:>\"')}]")
+    s = s.lstrip("<([{\"'` \t")
+    if not re.match(r"^[^/\s@]+@[^/\s@]+\.[^/\s@]+$", s):
+        return None
+    return s.lower()
+
+
+def detect_email_provider(email: str) -> str:
+    """Detect email provider for platform badge (gmail, outlook, yahoo, icloud, proton, or email)."""
+    norm = normalize_email(email)
+    if not norm:
+        return "email"
+    domain = norm.split("@")[-1].lower()
+    if domain in ("gmail.com", "googlemail.com"):
+        return "gmail"
+    if domain in ("outlook.com", "hotmail.com", "live.com", "msn.com"):
+        return "outlook"
+    if domain in ("yahoo.com", "ymail.com", "myyahoo.com"):
+        return "yahoo"
+    if domain in ("icloud.com", "me.com", "mac.com"):
+        return "icloud"
+    if domain in ("proton.me", "protonmail.com"):
+        return "proton"
+    return "email"
+
+
 def normalize_url(raw: str) -> str | None:
     """
     Clean and normalize a raw URL string.
@@ -97,6 +144,10 @@ def normalize_url(raw: str) -> str | None:
     if " " in url or "\t" in url:
         url = url.split()[0]
 
+    # Email addresses are not web URLs
+    if is_email(url):
+        return None
+
     # If there's no scheme, prepend https://
     if not re.match(r"^https?://", url, re.IGNORECASE):
         if "." not in url:
@@ -134,9 +185,12 @@ def normalize_url(raw: str) -> str | None:
 
 def detect_platform(url: str) -> str:
     """
-    Return a canonical platform key for the given URL.
+    Return a canonical platform key for the given URL or email.
     Falls back to "generic" for unrecognized hosts.
     """
+    if is_email(url):
+        return detect_email_provider(url)
+
     try:
         hostname = urlparse(url).hostname or ""
         hostname = hostname.lower().rstrip(".")

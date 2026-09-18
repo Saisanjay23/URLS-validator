@@ -85,7 +85,8 @@ async def _curl_cffi_get(
         pass  # tape is diagnostic only — never fail a fetch over it
     return resp
 
-from backend.url_utils import detect_platform, normalize_url, deduplicate_urls
+from backend.url_utils import detect_platform, normalize_url, deduplicate_urls, is_email
+from backend.email_checker import check_email
 from backend.logger import get_logger, log_check_result
 from backend.cookies import get_cookie_header_string, load_all_cookies
 
@@ -2929,6 +2930,22 @@ async def _check_with_confirmation(
     if not config.ENABLE_TEMPORAL_CONFIRMATION or first["status"] == "active":
         return first
 
+    # A geo-block is a property of the network vantage point, not of time: every
+    # re-observation from the same IP repeats the identical block notice. Retrying
+    # can only change the outcome when a DIFFERENT vantage point is actually
+    # available (proxy rotation on with 2+ proxies) — otherwise it just burns
+    # CONFIRM_ATTEMPTS-1 extra check cycles (each a full platform check, 10-50s
+    # for Facebook) to reconfirm what the first observation already established.
+    can_change_vantage = config.ENABLE_PROXY_ROTATION and len(config.PROXIES) >= 2
+    if first["status"] == "uncertain" and not can_change_vantage and (
+        "geo_blocked" in (first.get("audit_signals") or [])
+    ):
+        first["reason"] = (
+            f"{first['reason']} "
+            f"[skipped re-observation: geo-block is network-level, not transient]"
+        )
+        return first
+
     observations = [first]
     dead_count = 1 if first["status"] == "taken_down" else 0
 
@@ -3000,16 +3017,80 @@ async def process_urls_stream(
     _BASELINE_CACHE.clear()
     _BASELINE_LOCKS.clear()
 
-    urls = [u for raw in raw_urls if (u := normalize_url(raw))]
-    urls = deduplicate_urls(urls)
+    # Clean and deduplicate input items while preserving order
+    seen_raw = set()
+    unique_raw = []
+    for r in raw_urls:
+        if not r:
+            continue
+        cleaned = r.strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key not in seen_raw:
+            seen_raw.add(key)
+            unique_raw.append(cleaned)
 
-    total = len(urls)
+    total = len(unique_raw)
     if total == 0:
         yield {"done": True, "summary": {"total": 0, "active": 0, "taken_down": 0, "uncertain": 0}}
         return
 
     counts = {"active": 0, "taken_down": 0, "uncertain": 0}
     completed = 0
+
+    valid_urls = []
+    immediate_results = []
+    email_items = []
+    for raw in unique_raw:
+        if is_email(raw):
+            if config.ENABLE_EMAIL_VERIFICATION:
+                email_items.append(raw)
+            else:
+                immediate_results.append({
+                    "type": "result",
+                    "url": raw,
+                    "platform": detect_platform(raw),
+                    "status": "uncertain",
+                    "reason": "Email address provided - email verification is disabled",
+                    "http_code": None,
+                    "confidence": 0,
+                    "engine": "fast",
+                })
+            continue
+
+        norm = normalize_url(raw)
+        if norm:
+            valid_urls.append(norm)
+        else:
+            reason = "Invalid URL format (missing domain or protocol)"
+            if raw.startswith("@"):
+                reason = f"Social handle '{raw}' missing platform domain (e.g. t.me/{raw[1:]} or x.com/{raw[1:]})"
+            immediate_results.append({
+                "type": "result",
+                "url": raw,
+                "platform": "generic",
+                "status": "uncertain",
+                "reason": reason,
+                "http_code": None,
+                "confidence": 0,
+                "engine": "fast",
+            })
+
+    # Yield immediate results for invalid items so they are not lost
+    for res in immediate_results:
+        counts[res["status"]] = counts.get(res["status"], 0) + 1
+        completed += 1
+        res["progress"] = {"completed": completed, "total": total}
+        yield res
+
+    # Verify emails sequentially to respect mail server rate limits
+    for email_addr in email_items:
+        res = await check_email(email_addr)
+        counts[res["status"]] = counts.get(res["status"], 0) + 1
+        completed += 1
+        res["progress"] = {"completed": completed, "total": total}
+        yield res
 
     semaphore = asyncio.Semaphore(_CONCURRENT)
 
@@ -3086,15 +3167,16 @@ async def process_urls_stream(
             if config.ENABLE_ADAPTIVE_RATE_LIMIT:
                 rate_limiter.release(hostname)
 
-    async with aiohttp.ClientSession(connector=connector, cookie_jar=aiohttp.CookieJar()) as shared_session:
-        tasks = [asyncio.create_task(_sem_fast_worker(shared_session, u, detect_platform(u))) for u in urls]
+    if valid_urls:
+        async with aiohttp.ClientSession(connector=connector, cookie_jar=aiohttp.CookieJar()) as shared_session:
+            tasks = [asyncio.create_task(_sem_fast_worker(shared_session, u, detect_platform(u))) for u in valid_urls]
 
-        for coro in asyncio.as_completed(tasks):
-            result = await coro
-            counts[result["status"]] = counts.get(result["status"], 0) + 1
-            completed += 1
-            result["progress"] = {"completed": completed, "total": total}
-            yield result
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                counts[result["status"]] = counts.get(result["status"], 0) + 1
+                completed += 1
+                result["progress"] = {"completed": completed, "total": total}
+                yield result
 
     yield {"done": True, "summary": {"total": total, **counts}}
 

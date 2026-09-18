@@ -15,7 +15,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from backend.url_utils import normalize_url, detect_platform, deduplicate_urls  # noqa: E402
+from backend.url_utils import (  # noqa: E402
+    normalize_url, detect_platform, deduplicate_urls, is_email,
+    normalize_email, detect_email_provider
+)
 
 
 # ── Balanced brackets must survive ────────────────────────────────────────────
@@ -90,3 +93,96 @@ def test_detect_platform(url, platform):
 def test_deduplicate_preserves_order():
     urls = ["https://b.com", "https://a.com", "https://b.com"]
     assert deduplicate_urls(urls) == ["https://b.com", "https://a.com"]
+
+
+# ── Email detection & rejection ───────────────────────────────────────────────
+
+@pytest.mark.parametrize("email", [
+    "trace@gmail.com",
+    "seatowninternationaladmin@gmail.com",
+    "user.name+tag@example.com",
+    "admin@sub.domain.org",
+    "mailto:user@example.com",
+])
+def test_email_addresses_are_detected_and_rejected(email):
+    """Email addresses are not web URLs and must not be prepended with https://."""
+    assert is_email(email) is True
+    assert normalize_url(email) is None
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.youtube.com/@username",
+    "youtube.com/@username",
+    "https://medium.com/@author",
+    "https://t.me/rytbank",
+    "https://example.com/path",
+])
+def test_urls_with_at_in_path_are_not_emails(url):
+    """URLs that contain '@' in the path (e.g. YouTube handles) must normalize normally."""
+    assert is_email(url) is False
+    assert normalize_url(url) is not None
+
+
+@pytest.mark.asyncio
+async def test_process_urls_stream_handles_mixed_inputs():
+    """Verify that separate inputs (URLs, bare handles, emails) are never merged."""
+    from backend.fast_checker import process_urls_stream
+
+    raw_inputs = [
+        "https://t.me/rytbank",
+        "boostpayflexbackup",
+        "trace@gmail.com",
+        "seatowninternationaladmin@gmail.com",
+    ]
+    results = []
+    summary = None
+    async for event in process_urls_stream(raw_inputs):
+        if event.get("type") == "result":
+            results.append(event)
+        if event.get("done"):
+            summary = event.get("summary")
+
+    assert len(results) == 4
+    assert summary["total"] == 4
+    urls = [r["url"] for r in results]
+    assert "https://t.me/rytbank" in urls
+    assert "boostpayflexbackup" in urls
+    assert "trace@gmail.com" in urls
+    assert "seatowninternationaladmin@gmail.com" in urls
+    assert not any("rytbankboostpayflex" in u for u in urls)
+
+
+# ── Email normalization & platform tests ─────────────────────────────────────
+
+@pytest.mark.parametrize("raw,expected", [
+    ("user@example.com", "user@example.com"),
+    ("  User@Example.COM  ", "user@example.com"),
+    ("mailto:support@google.com", "support@google.com"),
+    ("<info@cyfirma.com>", "info@cyfirma.com"),
+    ("contact@domain.co.uk,", "contact@domain.co.uk"),
+    ("invalid-email", None),
+    ("@nodomain.com", None),
+    ("noat.com", None),
+    ("", None),
+])
+def test_normalize_email(raw, expected):
+    assert normalize_email(raw) == expected
+
+
+@pytest.mark.parametrize("email,expected_provider", [
+    ("test@gmail.com", "gmail"),
+    ("user@googlemail.com", "gmail"),
+    ("person@outlook.com", "outlook"),
+    ("person@hotmail.com", "outlook"),
+    ("person@live.com", "outlook"),
+    ("user@yahoo.com", "yahoo"),
+    ("user@ymail.com", "yahoo"),
+    ("user@icloud.com", "icloud"),
+    ("sec@proton.me", "proton"),
+    ("custom@company.org", "email"),
+])
+def test_detect_email_provider(email, expected_provider):
+    assert detect_email_provider(email) == expected_provider
+    assert detect_platform(email) == expected_provider
+
+

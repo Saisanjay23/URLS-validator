@@ -48,6 +48,9 @@ ENABLE_STEALTH_HEADERS      = _env_bool("ENABLE_STEALTH_HEADERS", default=True)
 ENABLE_REFERER_SPOOFING     = _env_bool("ENABLE_REFERER_SPOOFING", default=True)
 ENABLE_GOOGLE_CACHE_VERIFY  = _env_bool("ENABLE_GOOGLE_CACHE_VERIFY", default=True)
 ENABLE_WAYBACK_VERIFY       = _env_bool("ENABLE_WAYBACK_VERIFY", default=True)
+ENABLE_EMAIL_VERIFICATION   = _env_bool("ENABLE_EMAIL_VERIFICATION", default=True)
+EMAIL_SMTP_TIMEOUT          = float(os.environ.get("URLCHECK_EMAIL_SMTP_TIMEOUT", "10"))
+EMAIL_HELO_DOMAIN           = os.environ.get("URLCHECK_EMAIL_HELO_DOMAIN", "validator.local")
 
 # ── Verdict Verification Gate ─────────────────────────────────────────────────
 # Audits every `active` verdict against the page content actually fetched, so a
@@ -210,6 +213,7 @@ def get_all_flags() -> dict[str, Any]:
         "verdict_audit": ENABLE_VERDICT_AUDIT,
         "baseline_calibration": ENABLE_BASELINE_CALIBRATION,
         "audit_escalation": ENABLE_AUDIT_ESCALATION,
+        "email_verification": ENABLE_EMAIL_VERIFICATION,
     }
 
 

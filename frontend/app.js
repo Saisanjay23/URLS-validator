@@ -57,6 +57,12 @@
         linkedin:    '<i class="fab fa-linkedin" style="color: #0077b5;"></i>',
         app_store:   '<i class="fab fa-google-play" style="color: #3DDC84;"></i>',
         generic:     '<i class="fas fa-globe"></i>',
+        email:       '<i class="fas fa-envelope" style="color: #EA4335;"></i>',
+        gmail:       '<i class="fab fa-google" style="color: #EA4335;"></i>',
+        outlook:     '<i class="fab fa-microsoft" style="color: #0078D4;"></i>',
+        yahoo:       '<i class="fab fa-yahoo" style="color: #6001D2;"></i>',
+        icloud:      '<i class="fab fa-apple" style="color: #999999;"></i>',
+        proton:      '<i class="fas fa-shield-alt" style="color: #6D4AFF;"></i>',
     };
 
     const STATUS_LABELS = {
@@ -68,55 +74,56 @@
 
     // ── Input & URL normalization ────────────────────────────────────────
     function parseUrls(text) {
-        const rawLines = text.split(/\r?\n/).map(l => l.trim());
-        const merged = [];
-        
+        if (!text || !text.trim()) return [];
+
+        const rawLines = text.split(/\r?\n/);
+        const tokens = [];
+
         for (let line of rawLines) {
+            line = line.trim();
             if (!line) continue;
-            
-            const hasScheme = /^https?\s*:\/\//i.test(line);
-            
-            if (merged.length === 0 || hasScheme) {
-                merged.push(line);
-                continue;
-            }
-            
-            const prev = merged[merged.length - 1];
-            
-            // Special continuation characters (starts with / ? & = - _ .)
-            const startsWithSpecial = /^[/?&=\-_.]/.test(line);
-            const prevEndsWithSlash = /\/$/.test(prev);
-            
-            // Looks like a brand new URL (bare domain) e.g. adanirealtyworli.com
-            const isNewURL = /^www\./i.test(line) || /^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(\/.*)?$/.test(line);
-            
-            if (startsWithSpecial) {
-                merged[merged.length - 1] += line;
-            } else if (prevEndsWithSlash && !/^www\./i.test(line) && !isNewURL) {
-                merged[merged.length - 1] += line;
-            } else if (isNewURL) {
-                merged.push(line);
-            } else {
-                // If it doesn't look like a new URL, assume it's a broken fragment of the previous one
-                merged[merged.length - 1] += line;
+
+            // Strip leading bullet/numbering from line: "1. ", "1) ", "- ", "* ", "• "
+            line = line.replace(/^\s*(?:\d+[\.\)]|[-*•])\s+/, "").trim();
+            if (!line) continue;
+
+            // Split line by semicolons or tabs
+            const subParts = line.split(/[;\t]+/);
+            for (let part of subParts) {
+                part = part.trim();
+                if (!part) continue;
+
+                // Split if multiple URLs or comma-separated items are present on the line
+                const items = part.split(/(?:,\s*|\s+(?=https?:\/\/|[a-zA-Z0-9-]+\.[a-zA-Z]{2,}))/);
+                for (let item of items) {
+                    item = item.trim();
+                    if (!item) continue;
+
+                    // Strip any remaining bullet/numbering
+                    item = item.replace(/^\s*(?:\d+[\.\)]|[-*•])\s+/, "").trim();
+                    // Strip surrounding angle brackets or quotes
+                    item = item.replace(/^<([^>]+)>$/, "$1").replace(/^["'](.*)["']$/, "$1").trim();
+
+                    if (item) {
+                        tokens.push(item);
+                    }
+                }
             }
         }
-        
-        const uniqueUrls = new Set();
+
+        // Deduplicate while preserving original text & casing
+        const seen = new Set();
         const finalUrls = [];
-        for (let u of merged) {
+        for (let u of tokens) {
             if (!u) continue;
-            // Basic frontend normalization for deduplication
-            let norm = u.replace(/^(https?)\s*:\s*\/\//i, "$1://");
-            if (!/^https?:\/\//i.test(norm) && norm.indexOf('.') !== -1) {
-                norm = "https://" + norm;
-            }
-            if (!uniqueUrls.has(norm)) {
-                uniqueUrls.add(norm);
-                finalUrls.push(u); // Keep original text
+            // Key for deduplication: normalize scheme
+            let key = u.toLowerCase().replace(/^(https?)\s*:\s*\/\//i, "$1://");
+            if (!seen.has(key)) {
+                seen.add(key);
+                finalUrls.push(u);
             }
         }
-        
+
         return finalUrls;
     }
 
@@ -364,7 +371,10 @@
         tr.style.animationDelay = `${Math.min(rowIndex * 0.02, 0.5)}s`;
 
         const matchStatus = currentFilter === "all" || data.status === currentFilter;
-        const matchPlatform = currentPlatformFilter === "all" || data.platform === currentPlatformFilter;
+        const matchPlatform = (currentPlatformFilter === "all") ||
+            (currentPlatformFilter === "email"
+                ? ["email", "gmail", "outlook", "yahoo", "icloud", "proton"].includes(data.platform)
+                : data.platform === currentPlatformFilter);
         if (!matchStatus || !matchPlatform) tr.classList.add("hidden-row");
 
         const httpClass = getHttpClass(data.http_code);
@@ -372,19 +382,39 @@
         let platName = data.platform || "generic";
         if (platName === "x") platName = "X (Twitter)";
         else if (platName === "app_store") platName = "Apps";
+        else if (platName === "gmail") platName = "Gmail";
+        else if (platName === "outlook") platName = "Outlook";
+        else if (platName === "yahoo") platName = "Yahoo";
+        else if (platName === "icloud") platName = "iCloud Mail";
+        else if (platName === "proton") platName = "Proton Mail";
+        else if (platName === "email") platName = "Email";
         else platName = platName.split('_').map(cap).join(' ');
+
+        const isEmail = ["email", "gmail", "outlook", "yahoo", "icloud", "proton"].includes(data.platform) || (data.url && data.url.includes("@") && !data.url.startsWith("http"));
 
         const shotAttr = data.screenshot_url
             ? ` data-screenshot="${esc(data.screenshot_url)}"`
             : "";
         const shotClass = data.screenshot_url ? " has-screenshot" : "";
+
+        let urlCellHtml = "";
+        if (isEmail) {
+            urlCellHtml = `<span class="url-cell" style="user-select:all;font-family:monospace;cursor:text;color:var(--text);" title="${esc(data.url)}">${esc(data.url)}</span>`;
+        } else {
+            urlCellHtml = `<a href="${esc(data.url)}" target="_blank" rel="noopener noreferrer" class="url-cell${shotClass}" title="${esc(data.url)}"${shotAttr}>${truncUrl(data.url, 65)}</a>`;
+        }
+
+        const httpDisplay = (data.engine === "email_smtp" || isEmail) && data.http_code
+            ? `SMTP ${data.http_code}`
+            : (data.http_code ?? "—");
+
         tr.innerHTML = `
             <td class="col-num" style="text-align:center;color:var(--text-muted)">${rowIndex}</td>
-            <td class="col-url"><a href="${esc(data.url)}" target="_blank" rel="noopener noreferrer" class="url-cell${shotClass}" title="${esc(data.url)}"${shotAttr}>${truncUrl(data.url, 65)}</a></td>
-            <td class="col-platform"><span class="platform-badge">${icon} ${cap(platName)}</span></td>
+            <td class="col-url">${urlCellHtml}</td>
+            <td class="col-platform"><span class="platform-badge">${icon} ${platName}</span></td>
             <td class="col-status"><span class="status-pill status-pill--${data.status}"><span class="status-dot"></span>${STATUS_LABELS[data.status] || data.status}</span></td>
             <td class="col-reason"><span class="reason-text">${esc(data.reason || "—")}</span></td>
-            <td class="col-http"><span class="http-code ${httpClass}">${data.http_code ?? "—"}</span></td>
+            <td class="col-http"><span class="http-code ${httpClass}">${httpDisplay}</span></td>
         `;
         resultsBody.appendChild(tr);
     }
@@ -487,9 +517,12 @@
 
     function applyFilters() {
         resultsBody.querySelectorAll("tr").forEach(row => {
-            const ok = (currentFilter === "all" || row.dataset.status === currentFilter) &&
-                       (currentPlatformFilter === "all" || row.dataset.platform === currentPlatformFilter);
-            row.classList.toggle("hidden-row", !ok);
+            const matchStatus = currentFilter === "all" || row.dataset.status === currentFilter;
+            const matchPlatform = (currentPlatformFilter === "all") ||
+                (currentPlatformFilter === "email"
+                    ? ["email", "gmail", "outlook", "yahoo", "icloud", "proton"].includes(row.dataset.platform)
+                    : row.dataset.platform === currentPlatformFilter);
+            row.classList.toggle("hidden-row", !(matchStatus && matchPlatform));
         });
     }
 
