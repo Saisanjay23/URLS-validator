@@ -8,14 +8,20 @@ Provides cookie headers for HTTP requests.
 import json
 import os
 
-COOKIE_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "cookies.json"
+COOKIE_FILE = os.environ.get(
+    "URLCHECK_COOKIES_FILE",
+    os.environ.get(
+        "COOKIES_FILE",
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "cookies.json"
+        )
+    )
 )
 
 
 def load_all_cookies() -> dict[str, list[dict]]:
-    """Load all cookies from cookies.json."""
+    """Load all cookies from environment or cookies.json."""
     default_structure = {
         "facebook": [],
         "linkedin": [],
@@ -23,6 +29,19 @@ def load_all_cookies() -> dict[str, list[dict]]:
         "x": []
     }
     
+    # Check direct JSON environment variable (ideal for Docker/Render/Cloud without mounting files)
+    raw_env_json = os.environ.get("URLCHECK_COOKIES_JSON") or os.environ.get("COOKIES_JSON")
+    if raw_env_json:
+        try:
+            data = json.loads(raw_env_json)
+            cookies = data.get("cookies", data) if isinstance(data, dict) else {}
+            for key in default_structure:
+                if key not in cookies or not isinstance(cookies[key], list):
+                    cookies[key] = []
+            return cookies
+        except Exception:
+            pass
+
     if not os.path.exists(COOKIE_FILE):
         return default_structure
         

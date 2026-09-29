@@ -1,0 +1,68 @@
+{
+  "cookies": {
+    "facebook": [
+      {
+        "domain": ".facebook.com",
+        "name": "c_user",
+        "value": "YOUR_FACEBOOK_USER_ID",
+        "path": "/",
+        "secure": true,
+        "httpOnly": false
+      },
+      {
+        "domain": ".facebook.com",
+        "name": "xs",
+        "value": "YOUR_FACEBOOK_XS_SESSION_TOKEN",
+        "path": "/",
+        "secure": true,
+        "httpOnly": true
+      }
+    ],
+    "linkedin": [
+      {
+        "domain": ".linkedin.com",
+        "name": "li_at",
+        "value": "YOUR_LINKEDIN_LI_AT_COOKIE",
+        "path": "/",
+        "secure": true,
+        "httpOnly": true
+      }
+    ],
+    "instagram": [
+      {
+        "domain": ".instagram.com",
+        "name": "sessionid",
+        "value": "YOUR_INSTAGRAM_SESSION_ID",
+        "path": "/",
+        "secure": true,
+        "httpOnly": true
+      },
+      {
+        "domain": ".instagram.com",
+        "name": "ds_user_id",
+        "value": "YOUR_INSTAGRAM_USER_ID",
+        "path": "/",
+        "secure": true,
+        "httpOnly": false
+      }
+    ],
+    "x": [
+      {
+        "domain": ".x.com",
+        "name": "auth_token",
+        "value": "YOUR_X_AUTH_TOKEN",
+        "path": "/",
+        "secure": true,
+        "httpOnly": true
+      },
+      {
+        "domain": ".x.com",
+        "name": "ct0",
+        "value": "YOUR_X_CSRF_TOKEN",
+        "path": "/",
+        "secure": true,
+        "httpOnly": false
+      }
+    ]
+  }
+}

@@ -11,6 +11,10 @@ ENV/
 
 # Local configuration/credentials
 *.local
+cookies.json
+*.cookies.json
+.env
+.env.*
 
 # Logs and databases
 *.log
